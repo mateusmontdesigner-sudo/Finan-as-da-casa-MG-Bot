@@ -141,12 +141,24 @@ class SheetsManager:
             logger.error(f"❌ Erro ao registrar: {e}")
             return False, 0
 
-    def get_summary(self):
-        """Resumo da aba do mês atual"""
+    def listar_abas(self):
+        """Retorna abas de meses disponíveis"""
         try:
             if not self.spreadsheet:
                 self._connect()
-            nome_aba = MESES_PT[datetime.now().month]
+            abas = [ws.title for ws in self.spreadsheet.worksheets()]
+            return [a for a in abas if a.upper() in MESES_PT.values()]
+        except Exception as e:
+            logger.error(f"❌ Erro ao listar abas: {e}")
+            return []
+
+    def get_summary(self, nome_aba=None):
+        """Resumo da aba — usa mês atual se nome_aba não informado"""
+        try:
+            if not self.spreadsheet:
+                self._connect()
+            if not nome_aba:
+                nome_aba = MESES_PT[datetime.now().month]
             try:
                 ws = self.spreadsheet.worksheet(nome_aba)
             except gspread.WorksheetNotFound:
@@ -191,14 +203,15 @@ class SheetsManager:
             logger.error(f"❌ Erro no resumo: {e}")
             return None
 
-    def get_acerto(self):
-        """Calcula quem deve pra quem no mês atual"""
+    def get_acerto(self, nome_aba=None):
+        """Calcula quem deve pra quem — usa mês atual se nome_aba não informado"""
         try:
-            summary = self.get_summary()
+            if not nome_aba:
+                nome_aba = MESES_PT[datetime.now().month]
+            summary = self.get_summary(nome_aba)
             if not summary:
                 return None
 
-            nome_aba = MESES_PT[datetime.now().month]
             ws = self.spreadsheet.worksheet(nome_aba)
             rows = ws.get_all_values()
 
@@ -342,11 +355,38 @@ async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    nome_aba = None
+    if context.args:
+        import unicodedata
+        mes_arg = ' '.join(context.args).upper().strip()
+        mes_arg = ''.join(
+            c for c in unicodedata.normalize('NFD', mes_arg)
+            if unicodedata.category(c) != 'Mn'
+        )
+        mapa_acento = {'MARCO': 'MARÇO'}
+        nome_aba = mapa_acento.get(mes_arg, mes_arg)
+        if nome_aba not in MESES_PT.values():
+            abas = sheets.listar_abas()
+            lista = ', '.join(abas) if abas else 'nenhuma'
+            await update.message.reply_text(
+                f"❌ Mês <b>{mes_arg}</b> não encontrado.\n\n"
+                f"Meses disponíveis: <b>{lista}</b>\n\n"
+                f"Uso: /resumo MAIO ou /resumo JUNHO",
+                parse_mode='HTML'
+            )
+            return
+
     await update.message.reply_text("⏳ Consultando planilha...")
-    data = sheets.get_summary()
+    data = sheets.get_summary(nome_aba)
 
     if not data:
-        await update.message.reply_text("❌ Não encontrei dados para este mês. Pode ser que a aba ainda não exista.")
+        abas = sheets.listar_abas()
+        lista = ', '.join(abas) if abas else 'nenhuma'
+        await update.message.reply_text(
+            f"❌ Não encontrei dados para esse mês.\n"
+            f"Meses disponíveis: <b>{lista}</b>",
+            parse_mode='HTML'
+        )
         return
 
     msg = f"📊 <b>RESUMO — {data['mes']}</b>\n\n"
@@ -360,15 +400,45 @@ async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Aceita /acerto ou /acerto MAIO ou /acerto maio
+    nome_aba = None
+    if context.args:
+        mes_arg = ' '.join(context.args).upper().strip()
+        # Normalizar acentos
+        import unicodedata
+        mes_arg = ''.join(
+            c for c in unicodedata.normalize('NFD', mes_arg)
+            if unicodedata.category(c) != 'Mn'
+        )
+        # Mapear para nome com acento correto
+        mapa_acento = {'MARCO': 'MARÇO', 'FEVEREIRO': 'FEVEREIRO'}
+        nome_aba = mapa_acento.get(mes_arg, mes_arg)
+        if nome_aba not in MESES_PT.values():
+            abas = sheets.listar_abas()
+            lista = ', '.join(abas) if abas else 'nenhuma'
+            await update.message.reply_text(
+                f"❌ Mês <b>{mes_arg}</b> não encontrado.\n\n"
+                f"Meses disponíveis: <b>{lista}</b>\n\n"
+                f"Uso: /acerto MAIO ou /acerto JUNHO",
+                parse_mode='HTML'
+            )
+            return
+
     await update.message.reply_text("⏳ Calculando acerto...")
-    data = sheets.get_acerto()
+    data = sheets.get_acerto(nome_aba)
 
     if not data:
-        await update.message.reply_text("❌ Não foi possível calcular o acerto.")
+        abas = sheets.listar_abas()
+        lista = ', '.join(abas) if abas else 'nenhuma'
+        await update.message.reply_text(
+            f"❌ Não encontrei dados para esse mês.\n"
+            f"Meses disponíveis: <b>{lista}</b>",
+            parse_mode='HTML'
+        )
         return
 
     msg = f"💸 <b>ACERTO — {data['mes']}</b>\n\n"
-    msg += "Valor que cada um ainda precisa repassar:\n\n"
+    msg += "Valor que cada um precisa repassar:\n\n"
     for pessoa, val in data['deve'].items():
         if val > 0:
             msg += f"   • {pessoa}: R$ {val:.2f}\n"
