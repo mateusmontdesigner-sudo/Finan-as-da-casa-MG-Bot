@@ -9,7 +9,7 @@ import re
 import json
 import logging
 import unicodedata
-import anthropic
+import requests
 from datetime import datetime, date
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 SPREADSHEET_ID = '1r4krKnW3L_DHp6hAn5uIO_4xJQ0ugGdBNCLpNco7DnE'
 SHEET_URL = 'https://docs.google.com/spreadsheets/d/1r4krKnW3L_DHp6hAn5uIO_4xJQ0ugGdBNCLpNco7DnE/edit'
 
@@ -332,9 +332,9 @@ def calcular_divisao(categoria: str, quem_pagou: str):
 
 
 def chamar_claude(pergunta: str, dados: dict) -> str:
-    """Chama a API do Claude para responder perguntas sobre a planilha"""
-    if not ANTHROPIC_API_KEY:
-        return "❌ IA não configurada. Adicione a variável ANTHROPIC_API_KEY no Railway."
+    """Chama o Gemini para responder perguntas sobre a planilha"""
+    if not GEMINI_API_KEY:
+        return "❌ IA não configurada. Adicione a variável GEMINI_API_KEY no Railway."
 
     # Formatar dados para o contexto
     contexto = "Dados da planilha Finanças Casa MG:\n\n"
@@ -357,19 +357,20 @@ def chamar_claude(pergunta: str, dados: dict) -> str:
         "Formate valores como R$ X,XX. Seja conciso mas completo."
     )
 
+    prompt_completo = f"{system_prompt}\n\n{contexto}\n\nPergunta: {pergunta}"
+
     try:
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[
-                {"role": "user", "content": f"{contexto}\n\nPergunta: {pergunta}"}
-            ]
-        )
-        return message.content[0].text
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt_completo}]}],
+            "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.3}
+        }
+        resp = requests.post(url, json=payload, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        return result['candidates'][0]['content']['parts'][0]['text']
     except Exception as e:
-        logger.error(f"❌ Erro na API Claude: {e}")
+        logger.error(f"❌ Erro na API Gemini: {e}")
         return f"❌ Erro ao consultar a IA: {str(e)}"
 
 
