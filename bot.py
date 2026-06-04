@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
 SPREADSHEET_ID = '1r4krKnW3L_DHp6hAn5uIO_4xJQ0ugGdBNCLpNco7DnE'
 SHEET_URL = 'https://docs.google.com/spreadsheets/d/1r4krKnW3L_DHp6hAn5uIO_4xJQ0ugGdBNCLpNco7DnE/edit'
 
@@ -332,15 +332,20 @@ def calcular_divisao(categoria: str, quem_pagou: str):
 
 
 def chamar_claude(pergunta: str, dados: dict) -> str:
-    """Chama o Gemini para responder perguntas sobre a planilha"""
-    if not GEMINI_API_KEY:
-        return "❌ IA não configurada. Adicione a variável GEMINI_API_KEY no Railway."
+    """Chama o Groq para responder perguntas sobre a planilha"""
+    if not GROQ_API_KEY:
+        return "❌ IA não configurada. Adicione a variável GROQ_API_KEY no Railway."
 
-    # Formatar dados para o contexto
+    # Filtra apenas meses mencionados na pergunta, senão usa todos
+    pergunta_upper = normalizar(pergunta)
+    meses_mencionados = [m for m in dados.keys() if normalizar(m) in pergunta_upper]
+    dados_filtrados = {m: dados[m] for m in meses_mencionados} if meses_mencionados else dados
+
+    # Formatar dados para o contexto (limitado para economizar tokens)
     contexto = "Dados da planilha Finanças Casa MG:\n\n"
-    for mes, rows in dados.items():
+    for mes, rows in dados_filtrados.items():
         contexto += f"=== {mes} ===\n"
-        for r in rows:
+        for r in rows[:50]:  # máximo 50 linhas por mês
             quitado = r['quitacao'] or 'não informado'
             contexto += (
                 f"  {r['data_str'] or 'sem data'} | {r['pagador']} pagou R${r['valor']:.2f} "
@@ -357,21 +362,29 @@ def chamar_claude(pergunta: str, dados: dict) -> str:
         "Formate valores como R$ X,XX. Seja conciso mas completo."
     )
 
-    prompt_completo = f"{system_prompt}\n\n{contexto}\n\nPergunta: {pergunta}"
-
     try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt_completo}]}],
-            "generationConfig": {"maxOutputTokens": 1024, "temperature": 0.3}
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
         }
-        resp = requests.post(url, json=payload, timeout=30)
+        payload = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"{contexto}\n\nPergunta: {pergunta}"}
+            ],
+            "max_tokens": 1024,
+            "temperature": 0.3
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
         result = resp.json()
-        return result['candidates'][0]['content']['parts'][0]['text']
+        return result['choices'][0]['message']['content']
     except Exception as e:
-        logger.error(f"❌ Erro na API Gemini: {e}")
+        logger.error(f"❌ Erro na API Groq: {e}")
         return f"❌ Erro ao consultar a IA: {str(e)}"
+
 
 
 # ─── HANDLERS ────────────────────────────────────────────────
