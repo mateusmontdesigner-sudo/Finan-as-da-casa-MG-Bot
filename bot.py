@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 Finanças Casa MG - Bot do Telegram
-Assistente financeiro para gestão de gastos compartilhados
 """
 
 import os
 import re
+import json
 import logging
 from datetime import datetime
 from telegram import Update
@@ -14,18 +14,21 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import gspread
 from google.oauth2.service_account import Credentials
 
-# Configuração de logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Configurações
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 SPREADSHEET_ID = '1r4krKnW3L_DHp6hAn5uIO_4xJQ0ugGdBNCLpNco7DnE'
 
-# Mapeamento de usuários (Telegram username/first_name -> Nome na planilha)
+MESES_PT = {
+    1: 'JANEIRO', 2: 'FEVEREIRO', 3: 'MARÇO', 4: 'ABRIL',
+    5: 'MAIO', 6: 'JUNHO', 7: 'JULHO', 8: 'AGOSTO',
+    9: 'SETEMBRO', 10: 'OUTUBRO', 11: 'NOVEMBRO', 12: 'DEZEMBRO'
+}
+
 USER_MAPPING = {
     'mateus': 'Mateus',
     'cristhian': 'Cristhian',
@@ -33,391 +36,415 @@ USER_MAPPING = {
     'eli': 'Eli'
 }
 
-# Categorias que são divididas por 4 pessoas (incluindo Eli)
-CATEGORIAS_COM_ELI = ['água', 'agua', 'luz']
+# Divisão por 4 (inclui Eli)
+CATEGORIAS_COM_ELI = ['água', 'agua', 'luz', 'energia']
+
+# Divisão por 2
+CATEGORIAS_2_PESSOAS = ['gastos gata', 'gata']
+
+CATEGORIA_MAP = {
+    'mercado': 'Supermercado', 'supermercado': 'Supermercado',
+    'aluguel': 'Aluguel',
+    'água': 'Água', 'agua': 'Água',
+    'luz': 'Luz', 'energia': 'Luz',
+    'internet': 'Internet', 'wifi': 'Internet',
+    'gás': 'Gás', 'gas': 'Gás',
+    'limpeza': 'Limpeza',
+    'açougue': 'Açougue', 'acougue': 'Açougue', 'carne': 'Açougue',
+    'sacolão': 'Sacolão', 'sacalao': 'Sacolão', 'feira': 'Sacolão',
+    'padaria': 'Padaria', 'pão': 'Padaria',
+    'lanches': 'Lanches', 'lanche': 'Lanches',
+    'gata': 'Gastos Gata', 'veterinário': 'Gastos Gata',
+    'condução': 'Condução', 'uber': 'Condução', 'ônibus': 'Condução',
+    'rolê': 'Rolê', 'role': 'Rolê', 'passeio': 'Rolê',
+    'adobe': 'Pacote Adobe',
+    'nubank': 'Fatura Nubank',
+    'santander': 'Fatura Santander',
+    'bradesco': 'Fatura Bradesco',
+    'moto': 'Gastos Moto',
+    'investimento': 'Investimento',
+    'caixinha': 'Caixinha',
+    'família': 'Família', 'familia': 'Família',
+}
 
 
 class SheetsManager:
-    """Gerenciador de interações com Google Sheets"""
-    
     def __init__(self):
         self.client = None
-        self.sheet = None
-        self.setup_sheets()
-    
-    def setup_sheets(self):
-        """Configura conexão com Google Sheets"""
+        self.spreadsheet = None
+        self._connect()
+
+    def _connect(self):
         try:
-            # Usa credenciais de variável de ambiente
             creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
-            if creds_json:
-                import json
-                creds_dict = json.loads(creds_json)
-                scope = ['https://www.googleapis.com/auth/spreadsheets']
-                creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-                self.client = gspread.authorize(creds)
-                self.sheet = self.client.open_by_key(SPREADSHEET_ID).sheet1
-                logger.info("✅ Conectado ao Google Sheets")
-            else:
-                logger.warning("⚠️ GOOGLE_CREDENTIALS_JSON não configurado")
+            if not creds_json:
+                logger.error("GOOGLE_CREDENTIALS_JSON não configurado")
+                return
+            creds_dict = json.loads(creds_json)
+            scope = [
+                'https://www.googleapis.com/auth/spreadsheets',
+                'https://www.googleapis.com/auth/drive'
+            ]
+            creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+            self.client = gspread.authorize(creds)
+            self.spreadsheet = self.client.open_by_key(SPREADSHEET_ID)
+            logger.info("✅ Conectado ao Google Sheets")
         except Exception as e:
-            logger.error(f"❌ Erro ao conectar Google Sheets: {e}")
-    
-    def add_expense(self, data, quem_pagou, descricao, categoria, valor, divisao, quem_repassa, valor_pessoa):
-        """Adiciona um novo gasto na planilha"""
+            logger.error(f"❌ Erro ao conectar: {e}")
+
+    def _get_or_create_sheet(self, nome_aba):
+        """Pega a aba do mês atual, cria se não existir"""
         try:
-            if not self.sheet:
+            return self.spreadsheet.worksheet(nome_aba)
+        except gspread.WorksheetNotFound:
+            # Cria a aba com cabeçalho
+            ws = self.spreadsheet.add_worksheet(title=nome_aba, rows=100, cols=10)
+            ws.append_row([
+                'Data', 'Quem Pagou', 'Descrição', 'Categoria',
+                'Valor Total', 'Divisão', 'Quem irá Repassar',
+                'Valor por Pessoa', 'Quitações', 'TOTAL DO MÊS'
+            ])
+            return ws
+
+    def add_expense(self, quem_pagou, descricao, categoria, valor, divisao, quem_repassa):
+        try:
+            if not self.spreadsheet:
+                self._connect()
+            if not self.spreadsheet:
                 return False
-            
-            # Encontra a primeira linha vazia
-            values = self.sheet.get_all_values()
-            next_row = len(values) + 1
-            
-            # Formata a data
-            data_formatada = data.strftime('%d/%m/%Y')
-            
-            # Adiciona a linha
-            row_data = [
-                data_formatada,
+
+            now = datetime.now()
+            nome_aba = MESES_PT[now.month]
+            ws = self._get_or_create_sheet(nome_aba)
+
+            data_fmt = now.strftime('%d/%m/%Y')
+            valor_pessoa = valor / divisao
+            next_row = len(ws.get_all_values()) + 1
+
+            ws.append_row([
+                data_fmt,
                 quem_pagou,
                 descricao,
                 categoria,
-                valor,
+                f'R$ {valor:.2f}'.replace('.', ','),
                 divisao,
                 quem_repassa,
-                f'=E{next_row}/F{next_row}',  # Fórmula para valor por pessoa
-                '',  # Quitações (vazio)
-                ''   # Total do mês (vazio)
-            ]
-            
-            self.sheet.append_row(row_data, value_input_option='USER_ENTERED')
-            logger.info(f"✅ Gasto adicionado: {quem_pagou} - {descricao} - R$ {valor}")
-            return True
+                f'R$ {valor_pessoa:.2f}'.replace('.', ','),
+                '',
+                ''
+            ])
+            logger.info(f"✅ Registrado: {quem_pagou} - {descricao} - R${valor:.2f}")
+            return True, valor_pessoa
         except Exception as e:
-            logger.error(f"❌ Erro ao adicionar gasto: {e}")
-            return False
-    
+            logger.error(f"❌ Erro ao registrar: {e}")
+            return False, 0
+
     def get_summary(self):
-        """Retorna resumo dos gastos do mês"""
+        """Resumo da aba do mês atual"""
         try:
-            if not self.sheet:
+            if not self.spreadsheet:
+                self._connect()
+            nome_aba = MESES_PT[datetime.now().month]
+            try:
+                ws = self.spreadsheet.worksheet(nome_aba)
+            except gspread.WorksheetNotFound:
                 return None
-            
-            values = self.sheet.get_all_values()
-            if len(values) <= 1:
-                return {'total': 0, 'por_pessoa': {}}
-            
-            # Pula cabeçalho
-            data_rows = values[1:]
-            
-            totais = {
-                'Mateus': 0,
-                'Cristhian': 0,
-                'Marcelo': 0,
-                'Eli': 0
-            }
-            
-            total_geral = 0
-            
-            for row in data_rows:
-                if len(row) < 5:
+
+            rows = ws.get_all_values()
+            if len(rows) <= 1:
+                return {'mes': nome_aba, 'gastos': [], 'total': 0, 'por_pessoa': {}}
+
+            totais = {'Mateus': 0, 'Cristhian': 0, 'Marcelo': 0, 'Eli': 0}
+            gastos = []
+            total = 0
+
+            for row in rows[1:]:
+                if len(row) < 5 or not row[4]:
                     continue
-                
-                quem_pagou = row[1]
-                valor_str = row[4]
-                
-                # Remove formatação e converte
-                if valor_str:
-                    valor = float(valor_str.replace('R$', '').replace('.', '').replace(',', '.').strip())
-                    
-                    # Adiciona ao total da pessoa
-                    if quem_pagou in totais:
-                        totais[quem_pagou] += valor
-                    elif ', ' in quem_pagou:  # Pagamento compartilhado
-                        pagadores = quem_pagou.split(', ')
-                        valor_cada = valor / len(pagadores)
-                        for pagador in pagadores:
-                            if pagador in totais:
-                                totais[pagador] += valor_cada
-                    
-                    total_geral += valor
-            
+                val_str = row[4].replace('R$', '').replace('.', '').replace(',', '.').strip()
+                try:
+                    val = float(val_str)
+                except:
+                    continue
+
+                pagador = row[1]
+                descr = row[2] or row[3]
+                gastos.append({'pagador': pagador, 'descricao': descr, 'valor': val})
+                total += val
+
+                # Acumula por pessoa
+                pagadores = [p.strip() for p in pagador.split(',')]
+                val_cada = val / len(pagadores)
+                for p in pagadores:
+                    if p in totais:
+                        totais[p] += val_cada
+
             return {
-                'total': total_geral,
-                'por_pessoa': totais
+                'mes': nome_aba,
+                'gastos': gastos[-10:],  # últimos 10
+                'total': total,
+                'por_pessoa': {k: v for k, v in totais.items() if v > 0}
             }
         except Exception as e:
-            logger.error(f"❌ Erro ao gerar resumo: {e}")
+            logger.error(f"❌ Erro no resumo: {e}")
+            return None
+
+    def get_acerto(self):
+        """Calcula quem deve pra quem no mês atual"""
+        try:
+            summary = self.get_summary()
+            if not summary:
+                return None
+
+            nome_aba = MESES_PT[datetime.now().month]
+            ws = self.spreadsheet.worksheet(nome_aba)
+            rows = ws.get_all_values()
+
+            # Calcula quanto cada um DEVE (soma do que foi dividido com ele)
+            deve = {'Mateus': 0, 'Cristhian': 0, 'Marcelo': 0, 'Eli': 0}
+
+            for row in rows[1:]:
+                if len(row) < 8 or not row[4]:
+                    continue
+                val_str = row[4].replace('R$', '').replace('.', '').replace(',', '.').strip()
+                try:
+                    val = float(val_str)
+                except:
+                    continue
+
+                divisao = int(row[5]) if row[5].isdigit() else 3
+                quem_repassa = [p.strip() for p in row[6].split(',') if p.strip()]
+                pagador = row[1].strip()
+                val_pessoa = val / divisao
+
+                # Quem repassa deve ao pagador
+                for pessoa in quem_repassa:
+                    if pessoa in deve:
+                        deve[pessoa] += val_pessoa
+
+            return {'mes': nome_aba, 'deve': deve}
+        except Exception as e:
+            logger.error(f"❌ Erro no acerto: {e}")
             return None
 
 
-# Instância do gerenciador de planilhas
 sheets = SheetsManager()
 
 
 def identify_user(update: Update) -> str:
-    """Identifica o usuário a partir da mensagem do Telegram"""
     user = update.effective_user
-    
-    # Tenta pelo username
-    if user.username:
-        username_lower = user.username.lower()
-        for key, name in USER_MAPPING.items():
-            if key in username_lower:
-                return name
-    
-    # Tenta pelo first_name
-    if user.first_name:
-        first_name_lower = user.first_name.lower()
-        for key, name in USER_MAPPING.items():
-            if key in first_name_lower:
-                return name
-    
-    # Se não encontrar, retorna o first_name
+    for attr in [user.username, user.first_name]:
+        if attr:
+            for key, name in USER_MAPPING.items():
+                if key in attr.lower():
+                    return name
     return user.first_name or "Usuário"
 
 
+def parse_valor(valor_str: str) -> float:
+    """Converte string de valor para float"""
+    return float(valor_str.replace('.', '').replace(',', '.'))
+
+
+def detectar_gasto(text: str):
+    """Tenta extrair valor e descrição do texto"""
+    patterns = [
+        r'gastei\s+r?\$?\s*([\d.,]+)\s+(?:com|de|em|no|na)\s+(.+)',
+        r'paguei\s+r?\$?\s*([\d.,]+)\s+(?:de|da|do|com|no|na)\s+(.+)',
+        r'comprei\s+(.+?)\s+(?:por|de)\s+r?\$?\s*([\d.,]+)',
+        r'r?\$\s*([\d.,]+)\s+(?:de|da|do|com|em|no|na)\s+(.+)',
+        r'([\d.,]+)\s+(?:reais?|rs?)\s+(?:de|da|do|com)\s+(.+)',
+    ]
+    for i, p in enumerate(patterns):
+        m = re.search(p, text.lower())
+        if m:
+            if i == 2:  # "comprei X por Y"
+                return parse_valor(m.group(2)), m.group(1).strip().title()
+            else:
+                return parse_valor(m.group(1)), m.group(2).strip().title()
+    return None, None
+
+
+def detectar_categoria(descricao: str):
+    desc_lower = descricao.lower()
+    for key, cat in CATEGORIA_MAP.items():
+        if key in desc_lower:
+            return cat
+    return 'Outros'
+
+
+def calcular_divisao(categoria: str, quem_pagou: str):
+    cat_lower = categoria.lower()
+    desc_lower = categoria.lower()
+
+    if any(c in cat_lower for c in ['água', 'agua', 'luz', 'energia']):
+        divisao = 4
+        todos = ['Mateus', 'Cristhian', 'Marcelo', 'Eli']
+    elif any(c in desc_lower for c in ['gata', 'veterinário']):
+        divisao = 2
+        todos = ['Mateus', 'Cristhian']
+    else:
+        divisao = 3
+        todos = ['Mateus', 'Cristhian', 'Marcelo']
+
+    pagadores = [p.strip() for p in quem_pagou.split(',')]
+    quem_repassa = [p for p in todos if p not in pagadores]
+    return divisao, ', '.join(quem_repassa)
+
+
+# ─── HANDLERS ────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /start - Boas-vindas"""
-    message = """👋 Olá! Sou o **Finanças Casa MG**!
+    nome = identify_user(update)
+    msg = f"""👋 Olá, *{nome}*! Sou o *Finanças Casa MG* 🏠💰
 
-🏠💰 Estou aqui para gerenciar os gastos da casa.
+━━━━━━━━━━━━━━━━━━━━━━━
+📋 *COMO REGISTRAR GASTOS:*
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📋 **COMANDOS DISPONÍVEIS:**
+• "Gastei R$150 com mercado"
+• "Paguei R$80 de luz"
+• "Comprei carne por R$45"
+• "R$120 de supermercado"
 
-💰 **Registrar gasto:**
-   "Gastei R$150 com mercado"
-   "Paguei R$80 de luz"
+📊 *COMANDOS:*
+/resumo — gastos do mês
+/acerto — quem deve pra quem
+/historico — últimos registros
+/ajuda — instruções
 
-📊 **Ver resumo:**
-   /resumo
-
-💸 **Calcular acerto:**
-   /acerto
-
-📜 **Ver histórico:**
-   /historico
-
-❓ **Ajuda:**
-   /ajuda
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 **Planilha:**
-https://docs.google.com/spreadsheets/d/1r4krKnW3L_DHp6hAn5uIO_4xJQ0ugGdBNCLpNco7DnE/edit
-
-Pronto para começar! 🚀"""
-    
-    await update.message.reply_text(message, parse_mode='Markdown')
+━━━━━━━━━━━━━━━━━━━━━━━
+📊 [Abrir Planilha](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit)"""
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 
 async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /ajuda - Instruções"""
-    message = """📋 **COMO USAR O BOT:**
+    msg = """📋 *COMO USAR O BOT*
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 **REGISTRAR GASTOS:**
-
-Exemplos:
+━━━━━━━━━━━━━━━━━━━━━━━
+💰 *Registrar gasto:*
 • "Gastei R$150 com mercado"
 • "Paguei R$80 de luz"
-• "R$45 de limpeza"
+• "R$45 de açougue"
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 **COMANDOS:**
+⚡ *Regras de divisão:*
+🏠 Gastos gerais → ÷ 3 (Mateus, Cristhian, Marcelo)
+💧 Água e Luz → ÷ 4 (+ Eli)
+🐱 Gastos Gata → ÷ 2 (Mateus, Cristhian)
 
-/resumo - Ver quanto cada um pagou
-/acerto - Calcular quem deve pra quem
-/historico - Listar todos os gastos
-/ajuda - Ver esta mensagem
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚡ **REGRAS DE DIVISÃO:**
-
-🏠 **Gastos gerais** (mercado, limpeza, gás):
-   → Divididos entre Mateus, Cristhian e Marcelo
-
-💡 **Água e Luz:**
-   → Divididos entre 4 pessoas (vocês 3 + Eli)
-   → Eli paga antecipado, vocês repassam
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"""
-    
-    await update.message.reply_text(message, parse_mode='Markdown')
+📊 *Comandos:*
+/resumo — total do mês por pessoa
+/acerto — quanto cada um deve
+/historico — últimos lançamentos
+━━━━━━━━━━━━━━━━━━━━━━━"""
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 
 async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /resumo - Mostra resumo do mês"""
-    summary = sheets.get_summary()
-    
-    if not summary:
-        await update.message.reply_text("❌ Erro ao acessar a planilha.")
+    await update.message.reply_text("⏳ Consultando planilha...")
+    data = sheets.get_summary()
+
+    if not data:
+        await update.message.reply_text("❌ Não encontrei dados para este mês. Pode ser que a aba ainda não exista.")
         return
-    
-    message = f"""📊 **RESUMO DO MÊS**
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-💰 **TOTAL GERAL:** R$ {summary['total']:.2f}
+    msg = f"📊 *RESUMO — {data['mes']}*\n\n"
+    msg += f"💰 *Total geral: R$ {data['total']:.2f}*\n\n"
+    msg += "👥 *Pago por cada um:*\n"
+    for pessoa, val in data['por_pessoa'].items():
+        msg += f"   • {pessoa}: R$ {val:.2f}\n"
 
-👥 **TOTAL PAGO POR CADA UM:**
-"""
-    
-    for pessoa, valor in summary['por_pessoa'].items():
-        if valor > 0:
-            message += f"   • {pessoa}: R$ {valor:.2f}\n"
-    
-    message += f"""
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 Ver detalhes na planilha:
-https://docs.google.com/spreadsheets/d/1r4krKnW3L_DHp6hAn5uIO_4xJQ0ugGdBNCLpNco7DnE/edit"""
-    
-    await update.message.reply_text(message, parse_mode='Markdown')
+    msg += f"\n📊 [Ver planilha](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit)"
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 
 async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /acerto - Calcula quem deve pra quem"""
-    await update.message.reply_text(
-        "💸 **CÁLCULO DE ACERTO**\n\n"
-        "Esta funcionalidade calcula automaticamente quem deve pagar quanto para quem.\n\n"
-        "🔧 Em desenvolvimento... Por enquanto, consulte a aba de resumo na planilha:\n"
-        "https://docs.google.com/spreadsheets/d/1r4krKnW3L_DHp6hAn5uIO_4xJQ0ugGdBNCLpNco7DnE/edit",
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text("⏳ Calculando acerto...")
+    data = sheets.get_acerto()
+
+    if not data:
+        await update.message.reply_text("❌ Não foi possível calcular o acerto.")
+        return
+
+    msg = f"💸 *ACERTO — {data['mes']}*\n\n"
+    msg += "Valor que cada um ainda precisa repassar:\n\n"
+    for pessoa, val in data['deve'].items():
+        if val > 0:
+            msg += f"   • {pessoa}: R$ {val:.2f}\n"
+
+    msg += f"\n📊 [Ver planilha](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit)"
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 
 async def historico(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /historico - Lista todos os gastos"""
-    await update.message.reply_text(
-        "📜 **HISTÓRICO DE GASTOS**\n\n"
-        "Veja todos os gastos registrados na planilha:\n"
-        "https://docs.google.com/spreadsheets/d/1r4krKnW3L_DHp6hAn5uIO_4xJQ0ugGdBNCLpNco7DnE/edit",
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text("⏳ Buscando histórico...")
+    data = sheets.get_summary()
+
+    if not data or not data['gastos']:
+        await update.message.reply_text("❌ Nenhum gasto encontrado neste mês.")
+        return
+
+    msg = f"📜 *ÚLTIMOS GASTOS — {data['mes']}*\n\n"
+    for g in reversed(data['gastos']):
+        msg += f"• {g['pagador']}: {g['descricao']} — R$ {g['valor']:.2f}\n"
+
+    msg += f"\n📊 [Ver planilha](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit)"
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processa mensagens de texto (registro de gastos)"""
     text = update.message.text
     user_name = identify_user(update)
-    
-    # Pattern para detectar gastos: "Gastei R$100 com mercado"
-    patterns = [
-        r'gastei\s+r\$?\s*(\d+(?:,\d{2})?)\s+(?:com|de|em)\s+(.+)',
-        r'paguei\s+r\$?\s*(\d+(?:,\d{2})?)\s+(?:de|da|do)\s+(.+)',
-        r'r\$?\s*(\d+(?:,\d{2})?)\s+(?:de|da|do|com|em)\s+(.+)',
-        r'registrar:?\s*(.+?)\s*-?\s*r\$?\s*(\d+(?:,\d{2})?)',
-    ]
-    
-    matched = False
-    for i, pattern in enumerate(patterns):
-        match = re.search(pattern, text.lower())
-        if match:
-            matched = True
-            
-            # Extrai valor e descrição
-            if i == 3:  # Último pattern tem ordem invertida
-                descricao = match.group(1).strip().title()
-                valor_str = match.group(2)
-            else:
-                valor_str = match.group(1)
-                descricao = match.group(2).strip().title()
-            
-            # Converte valor
-            valor = float(valor_str.replace(',', '.'))
-            
-            # Identifica categoria
-            descricao_lower = descricao.lower()
-            if 'mercado' in descricao_lower or 'supermercado' in descricao_lower:
-                categoria = 'Supermercado'
-            elif 'aluguel' in descricao_lower:
-                categoria = 'Aluguel'
-            elif 'água' in descricao_lower or 'agua' in descricao_lower:
-                categoria = 'Água'
-            elif 'luz' in descricao_lower or 'energia' in descricao_lower:
-                categoria = 'Luz'
-            elif 'internet' in descricao_lower or 'wifi' in descricao_lower:
-                categoria = 'Internet'
-            elif 'gás' in descricao_lower or 'gas' in descricao_lower:
-                categoria = 'Gás'
-            elif 'limpeza' in descricao_lower:
-                categoria = 'Limpeza'
-            else:
-                categoria = 'Outros'
-            
-            # Determina divisão
-            if categoria.lower() in CATEGORIAS_COM_ELI:
-                divisao = 4
-                quem_repassa = 'Mateus, Marcelo, Cristhian'
-            else:
-                divisao = 3
-                # Remove o pagador da lista de quem repassa
-                todos = ['Mateus', 'Cristhian', 'Marcelo']
-                quem_repassa = ', '.join([p for p in todos if p != user_name])
-            
-            valor_pessoa = valor / divisao
-            
-            # Mensagem de confirmação
-            confirm_msg = f"""✅ **GASTO REGISTRADO!**
 
-👤 **Quem pagou:** {user_name}
-📝 **Descrição:** {descricao}
-🏷️ **Categoria:** {categoria}
-💰 **Valor Total:** R$ {valor:.2f}
-👥 **Divisão:** {divisao} pessoas
-💵 **Valor por pessoa:** R$ {valor_pessoa:.2f}
-🔄 **Quem irá repassar:** {quem_repassa}
-📅 **Data:** {datetime.now().strftime('%d/%m/%Y')}
+    valor, descricao = detectar_gasto(text)
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📊 Planilha atualizada!"""
-            
-            # Adiciona na planilha
-            success = sheets.add_expense(
-                datetime.now(),
-                user_name,
-                descricao,
-                categoria,
-                valor,
-                divisao,
-                quem_repassa,
-                valor_pessoa
-            )
-            
-            if success:
-                await update.message.reply_text(confirm_msg, parse_mode='Markdown')
-            else:
-                await update.message.reply_text(
-                    "❌ Erro ao registrar na planilha. Tente novamente ou registre manualmente."
-                )
-            
-            break
-    
-    if not matched:
-        # Mensagem não reconhecida - não responde para não poluir o grupo
-        pass
+    if valor is None or valor <= 0:
+        return  # Ignora mensagens que não são gastos
+
+    categoria = detectar_categoria(descricao)
+    divisao, quem_repassa = calcular_divisao(categoria, user_name)
+    valor_pessoa = valor / divisao
+
+    success, vp = sheets.add_expense(
+        user_name, descricao, categoria, valor, divisao, quem_repassa
+    )
+
+    if success:
+        msg = f"""✅ *GASTO REGISTRADO!*
+
+👤 *Pago por:* {user_name}
+📝 *Descrição:* {descricao}
+🏷️ *Categoria:* {categoria}
+💰 *Total:* R$ {valor:.2f}
+👥 *Divisão:* {divisao} pessoas → R$ {vp:.2f} cada
+🔄 *Repassar:* {quem_repassa}
+📅 *Data:* {datetime.now().strftime('%d/%m/%Y')}
+
+📊 [Ver na planilha](https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit)"""
+        await update.message.reply_text(msg, parse_mode='Markdown')
+    else:
+        await update.message.reply_text(
+            "❌ Erro ao registrar na planilha.\n\n"
+            "Verifique se a conta de serviço tem acesso à planilha:\n"
+            "Planilha → Compartilhar → adicione o e-mail do JSON com permissão de Editor."
+        )
 
 
 def main():
-    """Função principal - inicia o bot"""
     if not TELEGRAM_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN não configurado!")
         return
-    
-    # Cria a aplicação
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Registra handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("ajuda", ajuda))
-    application.add_handler(CommandHandler("help", ajuda))
-    application.add_handler(CommandHandler("resumo", resumo))
-    application.add_handler(CommandHandler("acerto", acerto))
-    application.add_handler(CommandHandler("historico", historico))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Inicia o bot
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ajuda", ajuda))
+    app.add_handler(CommandHandler("help", ajuda))
+    app.add_handler(CommandHandler("resumo", resumo))
+    app.add_handler(CommandHandler("acerto", acerto))
+    app.add_handler(CommandHandler("historico", historico))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
     logger.info("🚀 Bot iniciado!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == '__main__':
