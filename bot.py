@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# -<b>- coding: utf-8 -</b>-
 """
 Finanças Casa MG - Bot do Telegram
 """
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 SPREADSHEET_ID = '1r4krKnW3L_DHp6hAn5uIO_4xJQ0ugGdBNCLpNco7DnE'
 # Link fixo — evita que o Telegram quebre a URL com underscores do Markdown
-SHEET_URL = r'https://docs.google.com/spreadsheets/d/1r4krKnW3L\_DHp6hAn5uIO\_4xJQ0ugGdBNCLpNco7DnE/edit'
+SHEET_URL = 'https://docs.google.com/spreadsheets/d/1r4krKnW3L_DHp6hAn5uIO_4xJQ0ugGdBNCLpNco7DnE/edit'
 
 MESES_PT = {
     1: 'JANEIRO', 2: 'FEVEREIRO', 3: 'MARÇO', 4: 'ABRIL',
@@ -298,47 +298,47 @@ def calcular_divisao(categoria: str, quem_pagou: str):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nome = identify_user(update)
-    msg = f"""👋 Olá, *{nome}*! Sou o *Finanças Casa MG* 🏠💰
+    msg = f"""👋 Olá, <b>{nome}</b>! Sou o <b>Finanças Casa MG</b> 🏠💰
 
 ━━━━━━━━━━━━━━━━━━━━━━━
-📋 *COMO REGISTRAR GASTOS:*
+📋 <b>COMO REGISTRAR GASTOS:</b>
 
 • "Gastei R$150 com mercado"
 • "Paguei R$80 de luz"
 • "Comprei carne por R$45"
 • "R$120 de supermercado"
 
-📊 *COMANDOS:*
+📊 <b>COMANDOS:</b>
 /resumo — gastos do mês
 /acerto — quem deve pra quem
 /historico — últimos registros
 /ajuda — instruções
 
 ━━━━━━━━━━━━━━━━━━━━━━━
-📊 [Abrir Planilha]({SHEET_URL})"""
-    await update.message.reply_text(msg, parse_mode='Markdown')
+📊 <a href="{SHEET_URL}">Abrir Planilha</a>"""
+    await update.message.reply_text(msg, parse_mode='HTML')
 
 
 async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = """📋 *COMO USAR O BOT*
+    msg = """📋 <b>COMO USAR O BOT</b>
 
 ━━━━━━━━━━━━━━━━━━━━━━━
-💰 *Registrar gasto:*
+💰 <b>Registrar gasto:</b>
 • "Gastei R$150 com mercado"
 • "Paguei R$80 de luz"
 • "R$45 de açougue"
 
-⚡ *Regras de divisão:*
+⚡ <b>Regras de divisão:</b>
 🏠 Gastos gerais → ÷ 3 (Mateus, Cristhian, Marcelo)
 💧 Água e Luz → ÷ 4 (+ Eli)
 🐱 Gastos Gata → ÷ 2 (Mateus, Cristhian)
 
-📊 *Comandos:*
+📊 <b>Comandos:</b>
 /resumo — total do mês por pessoa
 /acerto — quanto cada um deve
 /historico — últimos lançamentos
 ━━━━━━━━━━━━━━━━━━━━━━━"""
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    await update.message.reply_text(msg, parse_mode='HTML')
 
 
 async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -349,14 +349,14 @@ async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Não encontrei dados para este mês. Pode ser que a aba ainda não exista.")
         return
 
-    msg = f"📊 *RESUMO — {data['mes']}*\n\n"
-    msg += f"💰 *Total geral: R$ {data['total']:.2f}*\n\n"
-    msg += "👥 *Pago por cada um:*\n"
+    msg = f"📊 <b>RESUMO — {data['mes']}</b>\n\n"
+    msg += f"💰 <b>Total geral: R$ {data['total']:.2f}</b>\n\n"
+    msg += "👥 <b>Pago por cada um:</b>\n"
     for pessoa, val in data['por_pessoa'].items():
         msg += f"   • {pessoa}: R$ {val:.2f}\n"
 
-    msg += f"\n📊 [Ver planilha]({SHEET_URL})"
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    msg += f'\n📊 <a href="{SHEET_URL}">Ver planilha</a>'
+    await update.message.reply_text(msg, parse_mode='HTML')
 
 
 async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,14 +367,14 @@ async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Não foi possível calcular o acerto.")
         return
 
-    msg = f"💸 *ACERTO — {data['mes']}*\n\n"
+    msg = f"💸 <b>ACERTO — {data['mes']}</b>\n\n"
     msg += "Valor que cada um ainda precisa repassar:\n\n"
     for pessoa, val in data['deve'].items():
         if val > 0:
             msg += f"   • {pessoa}: R$ {val:.2f}\n"
 
-    msg += f"\n📊 [Ver planilha]({SHEET_URL})"
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    msg += f'\n📊 <a href="{SHEET_URL}">Ver planilha</a>'
+    await update.message.reply_text(msg, parse_mode='HTML')
 
 
 async def historico(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -385,12 +385,12 @@ async def historico(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Nenhum gasto encontrado neste mês.")
         return
 
-    msg = f"📜 *ÚLTIMOS GASTOS — {data['mes']}*\n\n"
+    msg = f"📜 <b>ÚLTIMOS GASTOS — {data['mes']}</b>\n\n"
     for g in reversed(data['gastos']):
         msg += f"• {g['pagador']}: {g['descricao']} — R$ {g['valor']:.2f}\n"
 
-    msg += f"\n📊 [Ver planilha]({SHEET_URL})"
-    await update.message.reply_text(msg, parse_mode='Markdown')
+    msg += f'\n📊 <a href="{SHEET_URL}">Ver planilha</a>'
+    await update.message.reply_text(msg, parse_mode='HTML')
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -411,18 +411,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if success:
-        msg = f"""✅ *GASTO REGISTRADO!*
+        msg = f"""✅ <b>GASTO REGISTRADO!</b>
 
-👤 *Pago por:* {user_name}
-📝 *Descrição:* {descricao}
-🏷️ *Categoria:* {categoria}
-💰 *Total:* R$ {valor:.2f}
-👥 *Divisão:* {divisao} pessoas → R$ {vp:.2f} cada
-🔄 *Repassar:* {quem_repassa}
-📅 *Data:* {datetime.now().strftime('%d/%m/%Y')}
+👤 <b>Pago por:</b> {user_name}
+📝 <b>Descrição:</b> {descricao}
+🏷️ <b>Categoria:</b> {categoria}
+💰 <b>Total:</b> R$ {valor:.2f}
+👥 <b>Divisão:</b> {divisao} pessoas → R$ {vp:.2f} cada
+🔄 <b>Repassar:</b> {quem_repassa}
+📅 <b>Data:</b> {datetime.now().strftime('%d/%m/%Y')}
 
-📊 [Ver na planilha]({SHEET_URL})"""
-        await update.message.reply_text(msg, parse_mode='Markdown')
+📊 <a href="{SHEET_URL}">Ver na planilha</a>"""
+        await update.message.reply_text(msg, parse_mode='HTML')
     else:
         await update.message.reply_text(
             "❌ Erro ao registrar na planilha.\n\n"
