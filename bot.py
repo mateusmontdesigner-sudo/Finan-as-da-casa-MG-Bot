@@ -9,7 +9,7 @@ import re
 import json
 import logging
 import unicodedata
-import urllib.request
+import anthropic
 from datetime import datetime, date
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -357,32 +357,20 @@ def chamar_claude(pergunta: str, dados: dict) -> str:
         "Formate valores como R$ X,XX. Seja conciso mas completo."
     )
 
-    payload = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 1024,
-        "system": system_prompt,
-        "messages": [
-            {"role": "user", "content": f"{contexto}\n\nPergunta: {pergunta}"}
-        ]
-    }).encode('utf-8')
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01"
-        },
-        method="POST"
-    )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read().decode('utf-8'))
-            return result['content'][0]['text']
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1024,
+            system=system_prompt,
+            messages=[
+                {"role": "user", "content": f"{contexto}\n\nPergunta: {pergunta}"}
+            ]
+        )
+        return message.content[0].text
     except Exception as e:
         logger.error(f"❌ Erro na API Claude: {e}")
-        return "❌ Erro ao consultar a IA. Tente novamente."
+        return f"❌ Erro ao consultar a IA: {str(e)}"
 
 
 # ─── HANDLERS ────────────────────────────────────────────────
