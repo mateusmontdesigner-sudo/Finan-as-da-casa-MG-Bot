@@ -249,10 +249,18 @@ class SheetsManager:
             ]
             creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
             self.client = gspread.authorize(creds)
+
+            # Força timeout de 15s em TODAS as chamadas HTTP do gspread
+            original_request = self.client.http_client.request
+            def request_com_timeout(*args, **kwargs):
+                kwargs.setdefault('timeout', 15)
+                return original_request(*args, **kwargs)
+            self.client.http_client.request = request_com_timeout
+
             self.spreadsheet = self.client.open_by_key(SPREADSHEET_ID)
             logger.info("✅ Conectado ao Google Sheets")
         except Exception as e:
-            logger.error(f"❌ Erro ao conectar: {e}")
+            logger.error(f"❌ Erro ao conectar Sheets: {e}")
 
     def _get_or_create_sheet(self, nome_aba: str):
         try:
@@ -296,7 +304,10 @@ class SheetsManager:
                     return rows
 
             ws = self.spreadsheet.worksheet(nome_aba)
+            logger.info(f"📡 Buscando dados da aba '{nome_aba}' no Sheets...")
+            t0 = time.time()
             raw = ws.get_all_values()
+            logger.info(f"✅ Sheets respondeu em {time.time()-t0:.2f}s — {len(raw)} linhas")
             result = []
             for row in raw[1:]:
                 while len(row) < 10:
@@ -493,9 +504,17 @@ sheets = SheetsManager()
 _executor = ThreadPoolExecutor(max_workers=4)
 
 async def _run(func, *args, **kwargs):
-    """Executa função bloqueante em thread sem travar o event loop."""
+    """Executa função bloqueante em thread sem travar o event loop.
+    Garante timeout máximo de 20s — se ultrapassar, lança TimeoutError."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_executor, lambda: func(*args, **kwargs))
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(_executor, lambda: func(*args, **kwargs)),
+            timeout=20
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"⏰ Timeout em {func.__name__} após 20s")
+        raise
 
 
 # ─── DETECÇÃO LOCAL (sem Groq) ────────────────────────────────
@@ -814,7 +833,11 @@ async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nome_aba, _ = resolver_mes(list(context.args))
     await update.message.reply_text("⏳ Consultando planilha...")
-    data = await _run(sheets.get_summary, nome_aba)
+    try:
+        data = await _run(sheets.get_summary, nome_aba)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("❌ Tempo esgotado ao acessar a planilha. Tente novamente.")
+        return
 
     if data is None:
         abas = await _run(sheets.listar_abas)
@@ -854,7 +877,11 @@ async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data_fim = datas_encontradas[1]
 
     await update.message.reply_text("⏳ Calculando acerto...")
-    data = await _run(sheets.get_acerto, nome_aba, data_inicio, data_fim, True, pessoa_filtro)
+    try:
+        data = await _run(sheets.get_acerto, nome_aba, data_inicio, data_fim, True, pessoa_filtro)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("❌ Tempo esgotado ao acessar a planilha. Tente novamente em alguns segundos.")
+        return
 
     if data is None:
         abas = await _run(sheets.listar_abas)
