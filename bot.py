@@ -275,14 +275,29 @@ class SheetsManager:
             return ws
 
     def listar_abas(self) -> list:
+        """Retorna os títulos reais das abas que correspondem a meses."""
         try:
             if not self.spreadsheet:
                 self._connect()
-            return [ws.title for ws in self.spreadsheet.worksheets()
-                    if ws.title.upper() in MESES_NOMES]
+            abas = self.spreadsheet.worksheets()
+            logger.info(f"📋 Abas encontradas: {[ws.title for ws in abas]}")
+            return [ws.title for ws in abas if normalizar(ws.title) in MESES_NOMES]
         except Exception as e:
             logger.error(f"❌ Erro ao listar abas: {e}")
             return []
+
+    def resolver_nome_aba(self, nome_mes_normalizado: str) -> str | None:
+        """Dado 'MAIO', retorna o título real da aba (ex: 'Maio', 'maio', 'MAIO')."""
+        try:
+            if not self.spreadsheet:
+                self._connect()
+            for ws in self.spreadsheet.worksheets():
+                if normalizar(ws.title) == nome_mes_normalizado:
+                    return ws.title
+            return None
+        except Exception as e:
+            logger.error(f"❌ Erro ao resolver nome da aba: {e}")
+            return None
 
     def invalidar_cache(self, nome_aba: str = None):
         """Invalida cache de uma aba específica ou de todas."""
@@ -296,15 +311,18 @@ class SheetsManager:
             if not self.spreadsheet:
                 self._connect()
 
+            # Resolve o nome real da aba (a planilha pode ter 'Maio' em vez de 'MAIO')
+            nome_real = self.resolver_nome_aba(nome_aba) or nome_aba
+
             # Retorna do cache se ainda válido
-            entrada = self._cache.get(nome_aba)
+            entrada = self._cache.get(nome_real)
             if entrada:
                 ts, rows = entrada
                 if time.time() - ts < _CACHE_TTL:
                     return rows
 
-            ws = self.spreadsheet.worksheet(nome_aba)
-            logger.info(f"📡 Buscando dados da aba '{nome_aba}' no Sheets...")
+            ws = self.spreadsheet.worksheet(nome_real)
+            logger.info(f"📡 Buscando dados da aba '{nome_real}' no Sheets...")
             t0 = time.time()
             raw = ws.get_all_values()
             logger.info(f"✅ Sheets respondeu em {time.time()-t0:.2f}s — {len(raw)} linhas")
@@ -378,6 +396,7 @@ class SheetsManager:
                    apenas_nao_quitados=True, pessoa_filtro=None):
         if not nome_aba:
             nome_aba = MESES_PT[datetime.now().month]
+        nome_aba = self.resolver_nome_aba(nome_aba) or nome_aba
         rows = self.get_rows(nome_aba)
         if rows is None:
             return None
@@ -453,6 +472,7 @@ class SheetsManager:
         try:
             if not self.spreadsheet:
                 self._connect()
+            nome_aba = self.resolver_nome_aba(nome_aba) or nome_aba
             ws = self.spreadsheet.worksheet(nome_aba)
             rows = ws.get_all_values()
             if len(rows) <= 1:
