@@ -202,11 +202,12 @@ class SheetsManager:
             'por_pessoa': {k: v for k, v in totais.items() if v > 0}
         }
 
-    def get_acerto(self, nome_aba=None, data_inicio=None, data_fim=None, apenas_nao_quitados=False):
+    def get_acerto(self, nome_aba=None, data_inicio=None, data_fim=None, apenas_nao_quitados=True, pessoa_filtro=None):
         """
-        Calcula acerto com filtros opcionais:
-        - data_inicio / data_fim: objetos date
-        - apenas_nao_quitados: ignora linhas marcadas como 'quitado'
+        Calcula acerto líquido com filtros opcionais.
+        apenas_nao_quitados=True por padrão (comportamento do /acerto).
+        Para ver todos use apenas_nao_quitados=False (/extrato).
+        pessoa_filtro: se informado, mostra só transferências que envolvem essa pessoa.
         """
         if not nome_aba:
             nome_aba = MESES_PT[datetime.now().month]
@@ -217,32 +218,127 @@ class SheetsManager:
         # Aplicar filtros
         filtrados = []
         for r in rows:
-            if apenas_nao_quitados and 'quitado' in r['quitacao'] and 'não' not in r['quitacao'] and 'nao' not in r['quitacao']:
-                continue
+            if apenas_nao_quitados:
+                q = (r['quitacao'] or '').lower()
+                if 'quitado' in q and 'não' not in q and 'nao' not in q:
+                    continue
             if data_inicio and r['data'] and r['data'] < data_inicio:
                 continue
             if data_fim and r['data'] and r['data'] > data_fim:
                 continue
             filtrados.append(r)
 
-        # Calcula débitos: quem repassa → deve ao pagador
-        deve = {'Mateus': 0, 'Cristhian': 0, 'Marcelo': 0, 'Eli': 0}
-        detalhes = []
+        pessoas = ['Mateus', 'Cristhian', 'Marcelo', 'Eli']
+
+        # saldo[a][b] = quanto 'a' deve para 'b' (bruto, antes do abatimento)
+        saldo = {p: {q: 0.0 for q in pessoas} for p in pessoas}
+        detalhes_por_item = []  # [(pagador, desc, valor_total, [(devedor, valor_parte)])]
 
         for r in filtrados:
-            val_pessoa = r['valor'] / r['divisao']
-            for pessoa in r['repassa']:
-                if pessoa in deve:
-                    deve[pessoa] += val_pessoa
-            detalhes.append(r)
+            pagador = r['pagador']
+            val_parte = r['valor'] / r['divisao'] if r['divisao'] else r['valor']
+            devedores = []
+            for devedor in r['repassa']:
+                if devedor in pessoas and devedor != pagador:
+                    saldo[devedor][pagador] += val_parte
+                    devedores.append((devedor, val_parte))
+            if devedores:
+                detalhes_por_item.append({
+                    'data': r['data_str'] or 'sem data',
+                    'pagador': pagador,
+                    'descricao': r['descricao'] or r['categoria'],
+                    'valor_total': r['valor'],
+                    'valor_parte': val_parte,
+                    'devedores': devedores,
+                })
+
+        # Abatimento cruzado: A deve X para B e B deve Y para A → líquido
+        transferencias = []  # (de, para, valor_liquido)
+        processados = set()
+        for a in pessoas:
+            for b in pessoas:
+                if a >= b or (a, b) in processados:
+                    continue
+                processados.add((a, b))
+                a_para_b = saldo[a][b]
+                b_para_a = saldo[b][a]
+                liquido = a_para_b - b_para_a
+                if liquido > 0.01:
+                    transferencias.append((a, b, liquido))
+                elif liquido < -0.01:
+                    transferencias.append((b, a, -liquido))
+
+        # Filtrar por pessoa se solicitado
+        if pessoa_filtro:
+            transferencias = [
+                (de, para, val) for de, para, val in transferencias
+                if de == pessoa_filtro or para == pessoa_filtro
+            ]
+            detalhes_por_item = [
+                item for item in detalhes_por_item
+                if item['pagador'] == pessoa_filtro or
+                any(d == pessoa_filtro for d, _ in item['devedores'])
+            ]
 
         return {
             'mes': nome_aba,
-            'deve': {k: v for k, v in deve.items() if v > 0},
-            'detalhes': detalhes,
+            'transferencias': transferencias,
+            'detalhes_por_item': detalhes_por_item,
             'filtro_periodo': (data_inicio, data_fim),
             'apenas_nao_quitados': apenas_nao_quitados,
+            'total_itens': len(filtrados),
+            'pessoa_filtro': pessoa_filtro,
         }
+
+    def quitar_registros(self, nome_aba, data_inicio=None, data_fim=None):
+        """
+        Marca como 'Quitado' todas as linhas 'Não Quitado' na aba,
+        opcionalmente filtradas por período.
+        Retorna (qtd_atualizadas, total_linhas_nao_quitadas).
+        """
+        try:
+            if not self.spreadsheet:
+                self._connect()
+            ws = self.spreadsheet.worksheet(nome_aba)
+            rows = ws.get_all_values()
+            if len(rows) <= 1:
+                return 0, 0
+
+            atualizacoes = []  # lista de (row_index_1based, nova_val)
+            total_nao_quitados = 0
+
+            for i, row in enumerate(rows[1:], start=2):  # linha 2 em diante (1-based)
+                while len(row) < 9:
+                    row.append('')
+                quitacao = row[8].strip()
+                if quitacao != 'Não Quitado':
+                    continue
+                total_nao_quitados += 1
+
+                # Filtro de data
+                data_row = parse_data(row[0])
+                if data_inicio and data_row and data_row < data_inicio:
+                    continue
+                if data_fim and data_row and data_row > data_fim:
+                    continue
+
+                atualizacoes.append(i)
+
+            if not atualizacoes:
+                return 0, total_nao_quitados
+
+            # Atualiza em batch: coluna I = coluna 9
+            cell_list = [gspread.Cell(row=r, col=9, value='Quitado') for r in atualizacoes]
+            ws.update_cells(cell_list, value_input_option='USER_ENTERED')
+
+            logger.info(f"✅ {len(atualizacoes)} registros quitados em {nome_aba}")
+            return len(atualizacoes), total_nao_quitados
+
+        except gspread.WorksheetNotFound:
+            return None, None
+        except Exception as e:
+            logger.error(f"❌ Erro ao quitar registros: {e}")
+            return None, None
 
     def get_dados_completos(self):
         """Retorna dados de todas as abas para a IA analisar"""
@@ -401,7 +497,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 📊 <b>COMANDOS:</b>
 /resumo [mês] — gastos do mês
-/acerto [mês] [período] — quem deve pra quem
+/acerto [mês] [período] — acerto dos não quitados
+/extrato [mês] [período] — todos (quitados + não quitados)
 /historico [mês] — últimos registros
 /perguntar — consulte a IA sobre a planilha
 /ajuda — instruções completas
@@ -424,12 +521,20 @@ async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 • /resumo → mês atual
 • /resumo MAIO → mês específico
 
-💸 <b>Acerto:</b>
-• /acerto → mês atual, todos os gastos
+💸 <b>Acerto (não quitados):</b>
+• /acerto → mês atual
 • /acerto MAIO → mês específico
 • /acerto MAIO 17/05 31/05 → período específico
-• /acerto MAIO nao → só não quitados
-• /acerto MAIO 17/05 31/05 nao → período + não quitados
+• /acerto MAIO Mateus → filtrar por pessoa
+
+📒 <b>Extrato (todos):</b>
+• /extrato → mês atual
+• /extrato MAIO → mês específico
+• /extrato MAIO Mateus → filtrar por pessoa
+
+✅ <b>Quitar:</b>
+• /quitar MAIO → marca tudo como quitado
+• /quitar MAIO 17/05 31/05 → só o período
 
 🤖 <b>Perguntar à IA:</b>
 • /perguntar qual o total que o Mateus gastou em maio?
@@ -469,27 +574,29 @@ async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Uso: /acerto [MES] [dd/mm] [dd/mm] [nao]
+    Uso: /acerto [MES] [dd/mm] [dd/mm] [pessoa]
+    Mostra SOMENTE os itens não quitados.
     Exemplos:
       /acerto
       /acerto MAIO
       /acerto MAIO 17/05 31/05
-      /acerto MAIO nao
-      /acerto MAIO 17/05 31/05 nao
+      /acerto MAIO Mateus
+      /acerto MAIO 17/05 31/05 Mateus
     """
     args = list(context.args)
     nome_aba, args = resolver_mes(args)
 
-    # Detectar flags e datas nos args restantes
     data_inicio = None
     data_fim = None
-    apenas_nao_quitados = False
+    pessoa_filtro = None
     datas_encontradas = []
+
+    pessoas_validas = {normalizar(p): p for p in ['Mateus', 'Cristhian', 'Marcelo', 'Eli']}
 
     for arg in args:
         arg_norm = normalizar(arg)
-        if arg_norm in ('NAO', 'NÃO', 'NAOQUITADO', 'NQUITADO', 'N'):
-            apenas_nao_quitados = True
+        if arg_norm in pessoas_validas:
+            pessoa_filtro = pessoas_validas[arg_norm]
         else:
             d = parse_data_arg(arg)
             if d:
@@ -501,7 +608,7 @@ async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data_fim = datas_encontradas[1]
 
     await update.message.reply_text("⏳ Calculando acerto...")
-    data = sheets.get_acerto(nome_aba, data_inicio, data_fim, apenas_nao_quitados)
+    data = sheets.get_acerto(nome_aba, data_inicio, data_fim, apenas_nao_quitados=True, pessoa_filtro=pessoa_filtro)
 
     if data is None:
         abas = sheets.listar_abas()
@@ -511,34 +618,70 @@ async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Cabeçalho com filtros aplicados
-    filtro_desc = []
+    # Cabeçalho
+    filtro_desc = ["não quitados"]
     if data_inicio:
         filtro_desc.append(f"de {data_inicio.strftime('%d/%m')}")
     if data_fim:
         filtro_desc.append(f"até {data_fim.strftime('%d/%m')}")
-    if apenas_nao_quitados:
-        filtro_desc.append("não quitados")
+    if pessoa_filtro:
+        filtro_desc.append(f"filtro: {pessoa_filtro}")
     filtro_str = f" ({', '.join(filtro_desc)})" if filtro_desc else ""
 
-    msg = f"💸 <b>ACERTO — {data['mes']}{filtro_str}</b>\n\n"
+    msg = f"💸 <b>ACERTO — {data['mes']}{filtro_str}</b>\n"
+    msg += f"📦 {data['total_itens']} item(s) considerado(s)\n\n"
 
-    if not data['deve']:
-        msg += "✅ Nenhum valor pendente para esse filtro!"
+    transferencias = data['transferencias']
+    detalhes = data['detalhes_por_item']
+
+    if not transferencias:
+        msg += "✅ Tudo quitado! Nenhum saldo pendente."
     else:
-        msg += "Valor que cada um precisa repassar:\n\n"
-        for pessoa, val in data['deve'].items():
-            msg += f"   • <b>{pessoa}:</b> R$ {val:.2f}\n"
+        # ── RESUMO FINAL (saldo líquido) ──
+        msg += "💰 <b>RESUMO FINAL (após abatimento):</b>\n"
+        for de, para, val in sorted(transferencias, key=lambda x: -x[2]):
+            msg += f"   ➡️ <b>{de}</b> deve pagar <b>R$ {val:.2f}</b> para <b>{para}</b>\n"
 
-        # Detalhamento dos gastos incluídos
-        if data['detalhes']:
-            msg += f"\n📋 <b>Gastos incluídos ({len(data['detalhes'])}):</b>\n"
-            for r in data['detalhes']:
-                data_fmt = r['data_str'] or 'sem data'
-                msg += f"   {data_fmt} | {r['pagador']} | {r['descricao'] or r['categoria']} | R$ {r['valor']:.2f}\n"
+        # ── DETALHAMENTO POR ITEM ──
+        if detalhes:
+            msg += f"\n📋 <b>DETALHAMENTO POR ITEM:</b>\n"
+            for item in detalhes:
+                devedores_str = ", ".join(
+                    f"{d} (R$ {v:.2f})" for d, v in item['devedores']
+                )
+                msg += (
+                    f"\n• <b>{item['data']}</b> — {item['pagador']} pagou "
+                    f"R$ {item['valor_total']:.2f} de {item['descricao']}\n"
+                    f"  Deve repassar: {devedores_str}\n"
+                )
 
     msg += f'\n📊 <a href="{SHEET_URL}">Ver planilha</a>'
-    await update.message.reply_text(msg, parse_mode='HTML')
+
+    # Telegram tem limite de 4096 chars; divide se necessário
+    if len(msg) <= 4096:
+        await update.message.reply_text(msg, parse_mode='HTML')
+    else:
+        # Manda resumo separado do detalhamento
+        parte1 = msg[:msg.find('📋 <b>DETALHAMENTO')]
+        parte1 += f'\n📊 <a href="{SHEET_URL}">Ver planilha</a>'
+        await update.message.reply_text(parte1, parse_mode='HTML')
+
+        parte2 = f"📋 <b>DETALHAMENTO POR ITEM ({data['mes']}):</b>\n"
+        for item in detalhes:
+            devedores_str = ", ".join(
+                f"{d} (R$ {v:.2f})" for d, v in item['devedores']
+            )
+            linha = (
+                f"\n• <b>{item['data']}</b> — {item['pagador']} pagou "
+                f"R$ {item['valor_total']:.2f} de {item['descricao']}\n"
+                f"  Deve repassar: {devedores_str}\n"
+            )
+            if len(parte2) + len(linha) > 4096:
+                await update.message.reply_text(parte2, parse_mode='HTML')
+                parte2 = ""
+            parte2 += linha
+        if parte2:
+            await update.message.reply_text(parte2, parse_mode='HTML')
 
 
 async def historico(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -615,6 +758,195 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+
+async def extrato(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Uso: /extrato [MES] [dd/mm] [dd/mm] [pessoa]
+    Lista TODOS os registros (quitados e não quitados), item por item,
+    com valor total e repasse de cada. Sem cálculo de abatimento.
+    Exemplos:
+      /extrato
+      /extrato MAIO
+      /extrato MAIO 17/05 31/05
+      /extrato MAIO Mateus
+    """
+    args = list(context.args)
+    nome_aba, args = resolver_mes(args)
+
+    data_inicio = None
+    data_fim = None
+    pessoa_filtro = None
+    datas_encontradas = []
+
+    pessoas_validas = {normalizar(p): p for p in ['Mateus', 'Cristhian', 'Marcelo', 'Eli']}
+
+    for arg in args:
+        arg_norm = normalizar(arg)
+        if arg_norm in pessoas_validas:
+            pessoa_filtro = pessoas_validas[arg_norm]
+        else:
+            d = parse_data_arg(arg)
+            if d:
+                datas_encontradas.append(d)
+
+    if len(datas_encontradas) >= 1:
+        data_inicio = datas_encontradas[0]
+    if len(datas_encontradas) >= 2:
+        data_fim = datas_encontradas[1]
+
+    await update.message.reply_text("⏳ Buscando registros...")
+
+    if not nome_aba:
+        nome_aba = MESES_PT[datetime.now().month]
+    rows = sheets.get_rows(nome_aba)
+
+    if rows is None:
+        abas = sheets.listar_abas()
+        await update.message.reply_text(
+            f"❌ Mês não encontrado.\nDisponíveis: <b>{', '.join(abas)}</b>",
+            parse_mode='HTML'
+        )
+        return
+
+    # Aplicar filtros de data e pessoa
+    filtrados = []
+    for r in rows:
+        if data_inicio and r['data'] and r['data'] < data_inicio:
+            continue
+        if data_fim and r['data'] and r['data'] > data_fim:
+            continue
+        if pessoa_filtro:
+            if r['pagador'] != pessoa_filtro and pessoa_filtro not in r['repassa']:
+                continue
+        filtrados.append(r)
+
+    filtro_desc = []
+    if data_inicio:
+        filtro_desc.append(f"de {data_inicio.strftime('%d/%m')}")
+    if data_fim:
+        filtro_desc.append(f"até {data_fim.strftime('%d/%m')}")
+    if pessoa_filtro:
+        filtro_desc.append(f"filtro: {pessoa_filtro}")
+    filtro_str = f" ({', '.join(filtro_desc)})" if filtro_desc else ""
+
+    if not filtrados:
+        await update.message.reply_text(
+            f"📒 <b>EXTRATO — {nome_aba}{filtro_str}</b>\n\n"
+            "Nenhum registro encontrado para esse filtro.",
+            parse_mode='HTML'
+        )
+        return
+
+    total_geral = sum(r['valor'] for r in filtrados)
+    msg = f"📒 <b>EXTRATO — {nome_aba}{filtro_str}</b>\n"
+    msg += f"📦 {len(filtrados)} registro(s) | Total: R$ {total_geral:.2f}\n\n"
+
+    for r in filtrados:
+        status = "✅" if ('quitado' in r['quitacao'] and 'não' not in r['quitacao'] and 'nao' not in r['quitacao']) else "🔴"
+        val_parte = r['valor'] / r['divisao'] if r['divisao'] else r['valor']
+        repassa_str = ", ".join(r['repassa']) if r['repassa'] else "ninguém"
+        msg += (
+            f"{status} <b>{r['data_str'] or 'sem data'}</b> — {r['pagador']}\n"
+            f"   {r['descricao'] or r['categoria']} — R$ {r['valor']:.2f}\n"
+            f"   Repasse (R$ {val_parte:.2f} cada): {repassa_str}\n\n"
+        )
+
+    msg += f'📊 <a href="{SHEET_URL}">Ver planilha</a>'
+
+    # Divide em partes se passar do limite do Telegram
+    if len(msg) <= 4096:
+        await update.message.reply_text(msg, parse_mode='HTML')
+    else:
+        partes = []
+        parte_atual = f"📒 <b>EXTRATO — {nome_aba}{filtro_str}</b>\n"
+        parte_atual += f"📦 {len(filtrados)} registro(s) | Total: R$ {total_geral:.2f}\n\n"
+        for r in filtrados:
+            status = "✅" if ('quitado' in r['quitacao'] and 'não' not in r['quitacao'] and 'nao' not in r['quitacao']) else "🔴"
+            val_parte = r['valor'] / r['divisao'] if r['divisao'] else r['valor']
+            repassa_str = ", ".join(r['repassa']) if r['repassa'] else "ninguém"
+            linha = (
+                f"{status} <b>{r['data_str'] or 'sem data'}</b> — {r['pagador']}\n"
+                f"   {r['descricao'] or r['categoria']} — R$ {r['valor']:.2f}\n"
+                f"   Repasse (R$ {val_parte:.2f} cada): {repassa_str}\n\n"
+            )
+            if len(parte_atual) + len(linha) > 4000:
+                partes.append(parte_atual)
+                parte_atual = ""
+            parte_atual += linha
+        parte_atual += f'📊 <a href="{SHEET_URL}">Ver planilha</a>'
+        partes.append(parte_atual)
+        for p in partes:
+            await update.message.reply_text(p, parse_mode='HTML')
+
+async def quitar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Uso: /quitar [MES] [dd/mm] [dd/mm]
+    Marca todos os 'Não Quitado' do período como 'Quitado'.
+    Exemplos:
+      /quitar MAIO
+      /quitar MAIO 17/05 31/05
+    """
+    args = list(context.args)
+    nome_aba, args = resolver_mes(args)
+
+    if not nome_aba:
+        await update.message.reply_text(
+            "❌ Informe o mês. Exemplo:\n/quitar MAIO\n/quitar MAIO 17/05 31/05",
+            parse_mode='HTML'
+        )
+        return
+
+    data_inicio = None
+    data_fim = None
+    datas_encontradas = []
+
+    for arg in args:
+        d = parse_data_arg(arg)
+        if d:
+            datas_encontradas.append(d)
+
+    if len(datas_encontradas) >= 1:
+        data_inicio = datas_encontradas[0]
+    if len(datas_encontradas) >= 2:
+        data_fim = datas_encontradas[1]
+
+    # Confirmação antes de executar
+    filtro_desc = []
+    if data_inicio:
+        filtro_desc.append(f"de {data_inicio.strftime('%d/%m')}")
+    if data_fim:
+        filtro_desc.append(f"até {data_fim.strftime('%d/%m')}")
+    filtro_str = f" ({', '.join(filtro_desc)})" if filtro_desc else ""
+
+    await update.message.reply_text(f"⏳ Quitando registros de <b>{nome_aba}{filtro_str}</b>...", parse_mode='HTML')
+
+    qtd, total = sheets.quitar_registros(nome_aba, data_inicio, data_fim)
+
+    if qtd is None:
+        abas = sheets.listar_abas()
+        await update.message.reply_text(
+            f"❌ Mês não encontrado.\nDisponíveis: <b>{', '.join(abas)}</b>",
+            parse_mode='HTML'
+        )
+        return
+
+    if qtd == 0 and total == 0:
+        await update.message.reply_text(
+            f"✅ Nenhum registro <b>Não Quitado</b> encontrado em <b>{nome_aba}{filtro_str}</b>.",
+            parse_mode='HTML'
+        )
+    elif qtd == 0:
+        await update.message.reply_text(
+            f"⚠️ Nenhum registro no período <b>{nome_aba}{filtro_str}</b> estava pendente.",
+            parse_mode='HTML'
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ <b>{qtd} registro(s)</b> marcado(s) como <b>Quitado</b> em <b>{nome_aba}{filtro_str}</b>!\n"
+            f"📊 Total de não quitados no mês: {total} → agora: {total - qtd}",
+            parse_mode='HTML'
+        )
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN não configurado!")
@@ -627,6 +959,8 @@ def main():
     app.add_handler(CommandHandler("resumo", resumo))
     app.add_handler(CommandHandler("acerto", acerto))
     app.add_handler(CommandHandler("historico", historico))
+    app.add_handler(CommandHandler("extrato", extrato))
+    app.add_handler(CommandHandler("quitar", quitar))
     app.add_handler(CommandHandler("perguntar", perguntar))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
