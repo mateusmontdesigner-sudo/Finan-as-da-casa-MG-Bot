@@ -13,6 +13,8 @@ import logging
 import unicodedata
 import requests
 import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -199,11 +201,27 @@ def calcular_divisao(categoria: str, quem_pagou: str):
 
 
 def resolver_mes(args: list):
+    """
+    Extrai o mês dos args, aceitando:
+    - ['MAIO', ...]           → 'MAIO'
+    - ['de', 'MAIO', ...]     → 'MAIO'
+    - ['do', 'MES', ...]      → 'MES'
+    """
     if not args:
         return None, []
+    # Tenta o primeiro arg direto
     candidato = normalizar(args[0])
     if candidato in MESES_NOMES:
         return candidato, args[1:]
+    # Tenta pular preposições ('de', 'do', 'da', 'em') e pegar o próximo
+    if candidato in {'DE', 'DO', 'DA', 'EM', 'NO', 'NA'} and len(args) > 1:
+        candidato2 = normalizar(args[1])
+        if candidato2 in MESES_NOMES:
+            return candidato2, args[2:]
+    # Busca o mês em qualquer posição nos args
+    for i, arg in enumerate(args):
+        if normalizar(arg) in MESES_NOMES:
+            return normalizar(arg), args[:i] + args[i+1:]
     return None, args
 
 
@@ -470,6 +488,14 @@ class SheetsManager:
 
 
 sheets = SheetsManager()
+
+# Executor dedicado para chamadas bloqueantes (Sheets, Groq)
+_executor = ThreadPoolExecutor(max_workers=4)
+
+async def _run(func, *args, **kwargs):
+    """Executa função bloqueante em thread sem travar o event loop."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_executor, lambda: func(*args, **kwargs))
 
 
 # ─── DETECÇÃO LOCAL (sem Groq) ────────────────────────────────
@@ -788,10 +814,10 @@ async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nome_aba, _ = resolver_mes(list(context.args))
     await update.message.reply_text("⏳ Consultando planilha...")
-    data = sheets.get_summary(nome_aba)
+    data = await _run(sheets.get_summary, nome_aba)
 
     if data is None:
-        abas = sheets.listar_abas()
+        abas = await _run(sheets.listar_abas)
         await update.message.reply_text(
             f"❌ Mês não encontrado.\nDisponíveis: <b>{', '.join(abas)}</b>",
             parse_mode='HTML'
@@ -828,11 +854,10 @@ async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data_fim = datas_encontradas[1]
 
     await update.message.reply_text("⏳ Calculando acerto...")
-    data = sheets.get_acerto(nome_aba, data_inicio, data_fim,
-                             apenas_nao_quitados=True, pessoa_filtro=pessoa_filtro)
+    data = await _run(sheets.get_acerto, nome_aba, data_inicio, data_fim, True, pessoa_filtro)
 
     if data is None:
-        abas = sheets.listar_abas()
+        abas = await _run(sheets.listar_abas)
         await update.message.reply_text(
             f"❌ Mês não encontrado.\nDisponíveis: <b>{', '.join(abas)}</b>",
             parse_mode='HTML'
@@ -895,7 +920,7 @@ async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def historico(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nome_aba, _ = resolver_mes(list(context.args))
     await update.message.reply_text("⏳ Buscando histórico...")
-    data = sheets.get_summary(nome_aba)
+    data = await _run(sheets.get_summary, nome_aba)
 
     if not data or not data['gastos']:
         await update.message.reply_text("❌ Nenhum gasto encontrado neste mês.")
@@ -934,10 +959,10 @@ async def extrato(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not nome_aba:
         nome_aba = MESES_PT[datetime.now().month]
-    rows = sheets.get_rows(nome_aba)
+    rows = await _run(sheets.get_rows, nome_aba)
 
     if rows is None:
-        abas = sheets.listar_abas()
+        abas = await _run(sheets.listar_abas)
         await update.message.reply_text(
             f"❌ Mês não encontrado.\nDisponíveis: <b>{', '.join(abas)}</b>",
             parse_mode='HTML'
@@ -1024,10 +1049,10 @@ async def quitar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏳ Quitando registros de <b>{nome_aba}{filtro_str}</b>...", parse_mode='HTML'
     )
 
-    qtd, total = sheets.quitar_registros(nome_aba, data_inicio, data_fim)
+    qtd, total = await _run(sheets.quitar_registros, nome_aba, data_inicio, data_fim)
 
     if qtd is None:
-        abas = sheets.listar_abas()
+        abas = await _run(sheets.listar_abas)
         await update.message.reply_text(
             f"❌ Mês não encontrado.\nDisponíveis: <b>{', '.join(abas)}</b>",
             parse_mode='HTML'
@@ -1062,17 +1087,18 @@ async def perguntar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     meses_mencionados = [m for m in MESES_NOMES if m in pergunta_norm]
     if meses_mencionados:
-        dados = {m: rows for m in meses_mencionados if (rows := sheets.get_rows(m))}
+        rows_list = await asyncio.gather(*[_run(sheets.get_rows, m) for m in meses_mencionados])
+        dados = {m: r for m, r in zip(meses_mencionados, rows_list) if r}
     else:
         mes_atual = MESES_PT[datetime.now().month]
-        rows = sheets.get_rows(mes_atual)
+        rows = await _run(sheets.get_rows, mes_atual)
         dados = {mes_atual: rows} if rows else {}
 
     if not dados:
         await update.message.reply_text("❌ Não consegui acessar a planilha.")
         return
 
-    resposta = chamar_groq_perguntar(pergunta, dados)
+    resposta = await _run(chamar_groq_perguntar, pergunta, dados)
     await update.message.reply_text(f"🤖 {resposta}")
 
 
@@ -1158,7 +1184,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 3. Groq — somente se as etapas 1 e 2 falharam ────────
     if resultado is None:
-        resultado = _chamar_groq_unificado(text, user_name)
+        resultado = await _run(_chamar_groq_unificado, text, user_name)
 
     tipo = resultado.get('tipo', 'intencao')
 
@@ -1176,7 +1202,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         divisao, quem_repassa = calcular_divisao(categoria, pagador)
-        success, vp = sheets.add_expense(pagador, descricao, categoria, valor, divisao, quem_repassa)
+        success, vp = await _run(sheets.add_expense, pagador, descricao, categoria, valor, divisao, quem_repassa)
         if success:
             await msg.reply_text(
                 f"✅ <b>GASTO REGISTRADO!</b>\n\n"
