@@ -388,7 +388,70 @@ def parse_data_arg(texto):
     return None
 
 
+def detectar_gasto_ia(text: str, user_name: str) -> dict | None:
+    """
+    Usa o Groq para extrair dados de registro de gasto de qualquer mensagem.
+    Retorna dict com: pagador, descricao, valor ou None se não for gasto.
+    """
+    if not GROQ_API_KEY:
+        return None
+
+    categorias = list(set(CATEGORIA_MAP.values()))
+    pessoas = list(USER_MAPPING.values())
+
+    system_prompt = f"""Você extrai dados de gastos de mensagens de uma república.
+Moradores: {', '.join(pessoas)}.
+Quem enviou a mensagem: {user_name}.
+Categorias disponíveis: {', '.join(categorias)}.
+Data atual: {datetime.now().strftime('%d/%m/%Y')}.
+
+Se a mensagem descreve um gasto/pagamento/compra, responda APENAS com JSON:
+{{
+  "eh_gasto": true,
+  "pagador": "<quem pagou, se não informado use '{user_name}'>",
+  "descricao": "<descrição curta do item>",
+  "categoria": "<categoria mais próxima da lista ou 'Outros'>",
+  "valor": <número decimal>
+}}
+
+Se NÃO for um gasto, responda apenas:
+{{"eh_gasto": false}}
+
+Exemplos:
+"gastei 50 de mercado" -> pagador={user_name}, descricao=Mercado, categoria=Supermercado, valor=50.0
+"Marcelo pagou 90 de açougue" -> pagador=Marcelo, descricao=Açougue, categoria=Açougue, valor=90.0
+"carne pra churrasco 120 reais" -> pagador={user_name}, descricao=Carne para churrasco, categoria=Açougue, valor=120.0
+"sacolão 37,50" -> pagador={user_name}, descricao=Sacolão, categoria=Sacolão, valor=37.5
+"faz o acerto de maio" -> eh_gasto=false
+"bom dia" -> eh_gasto=false"""
+
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {{"Authorization": f"Bearer {{GROQ_API_KEY}}", "Content-Type": "application/json"}}
+        payload = {{
+            "model": "llama-3.1-8b-instant",
+            "messages": [
+                {{"role": "system", "content": system_prompt}},
+                {{"role": "user", "content": text}}
+            ],
+            "max_tokens": 150,
+            "temperature": 0.0
+        }}
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        raw = re.sub(r"```json|```", "", raw).strip()
+        data = json.loads(raw)
+        if data.get("eh_gasto"):
+            return data
+        return None
+    except Exception as e:
+        logger.error(f"Erro ao detectar gasto via IA: {{e}}")
+        return None
+
+
 def detectar_gasto(text: str):
+    """Mantido para compatibilidade — detecta padrões simples sem IA"""
     patterns = [
         r'gastei\s+r?\$?\s*([\d.,]+)\s+(?:com|de|em|no|na)\s+(.+)',
         r'paguei\s+r?\$?\s*([\d.,]+)\s+(?:de|da|do|com|no|na)\s+(.+)',
@@ -714,9 +777,27 @@ async def perguntar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     pergunta = ' '.join(context.args)
+    pergunta_norm = normalizar(pergunta)
+
     await update.message.reply_text("🤖 Consultando a IA, aguarde...")
 
-    dados = sheets.get_dados_completos()
+    # Detecta se a pergunta menciona um mês específico — se sim, lê só ele
+    meses_validos = list(MESES_PT.values())  # ['JANEIRO', 'FEVEREIRO', ...]
+    meses_mencionados = [m for m in meses_validos if m in pergunta_norm]
+
+    if meses_mencionados:
+        # Lê só os meses mencionados
+        dados = {}
+        for mes in meses_mencionados:
+            rows = sheets.get_rows(mes)
+            if rows:
+                dados[mes] = rows
+    else:
+        # Sem mês específico: lê só o mês atual para ser rápido
+        mes_atual = MESES_PT[datetime.now().month]
+        rows = sheets.get_rows(mes_atual)
+        dados = {mes_atual: rows} if rows else {}
+
     if not dados:
         await update.message.reply_text("❌ Não consegui acessar a planilha.")
         return
@@ -725,23 +806,91 @@ async def perguntar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🤖 {resposta}")
 
 
+def detectar_intencao_ia(text: str) -> dict:
+    """
+    Usa o Groq para identificar a intenção da mensagem e extrair parâmetros.
+    Retorna dict com: intencao, mes, data_inicio, data_fim, pessoa
+    """
+    if not GROQ_API_KEY:
+        return {"intencao": "perguntar"}
+
+    mes_atual = MESES_PT[datetime.now().month]
+
+    system_prompt = f"""Você é um classificador de intenções para um bot financeiro de república.
+Os moradores são: Mateus, Cristhian, Marcelo, Eli.
+O mês atual é {mes_atual}.
+
+Analise a mensagem e responda APENAS com um JSON no formato:
+{{
+  "intencao": "<uma das opções abaixo>",
+  "mes": "<nome do mês em maiúsculo ou null>",
+  "data_inicio": "<dd/mm ou null>",
+  "data_fim": "<dd/mm ou null>",
+  "pessoa": "<nome da pessoa ou null>"
+}}
+
+Opções de intenção:
+- "acerto": quer ver quem deve quanto para quem (não quitados, com abatimento)
+- "extrato": quer ver lista de todos os registros (quitados e não quitados)
+- "resumo": quer ver resumo/total de gastos do mês
+- "quitar": quer marcar registros como quitado
+- "ajuda": quer saber o que o bot faz
+- "perguntar": qualquer outra pergunta sobre a planilha/finanças
+- "fora_escopo": assunto não relacionado a finanças da casa
+
+Exemplos:
+"faz o acerto de maio" -> acerto, mes=MAIO
+"quem deve o quê esse mês" -> acerto, mes={mes_atual}
+"mostra tudo de junho" -> extrato, mes=JUNHO
+"quanto gastamos em maio" -> resumo, mes=MAIO
+"quita os pendentes de maio do dia 17 ao 31" -> quitar, mes=MAIO, data_inicio=17/05, data_fim=31/05
+"o que o Mateus deve" -> acerto, pessoa=Mateus
+"bom dia" -> fora_escopo
+"qual time ganhou ontem" -> fora_escopo"""
+
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            "max_tokens": 150,
+            "temperature": 0.0
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"].strip()
+        # Remove blocos markdown se houver
+        raw = re.sub(r"```json|```", "", raw).strip()
+        return json.loads(raw)
+    except Exception as e:
+        logger.error(f"Erro ao detectar intenção: {e}")
+        return {"intencao": "perguntar"}
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    if not text:
+        return
     user_name = identify_user(update)
 
-    valor, descricao = detectar_gasto(text)
-    if valor is None or valor <= 0:
-        return
+    # 1. Usa IA para entender qualquer forma de registro de gasto
+    gasto = detectar_gasto_ia(text, user_name)
+    if gasto:
+        pagador = gasto.get("pagador", user_name)
+        descricao = gasto.get("descricao", "")
+        categoria = gasto.get("categoria", "Outros")
+        valor = float(gasto.get("valor", 0))
+        if valor > 0:
+            divisao, quem_repassa = calcular_divisao(categoria, pagador)
+            success, vp = sheets.add_expense(pagador, descricao, categoria, valor, divisao, quem_repassa)
+            if success:
+                msg = f"""✅ <b>GASTO REGISTRADO!</b>
 
-    categoria = detectar_categoria(descricao)
-    divisao, quem_repassa = calcular_divisao(categoria, user_name)
-
-    success, vp = sheets.add_expense(user_name, descricao, categoria, valor, divisao, quem_repassa)
-
-    if success:
-        msg = f"""✅ <b>GASTO REGISTRADO!</b>
-
-👤 <b>Pago por:</b> {user_name}
+👤 <b>Pago por:</b> {pagador}
 📝 <b>Descrição:</b> {descricao}
 🏷️ <b>Categoria:</b> {categoria}
 💰 <b>Total:</b> R$ {valor:.2f}
@@ -750,12 +899,62 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 📅 <b>Data:</b> {datetime.now().strftime('%d/%m/%Y')}
 
 📊 <a href="{SHEET_URL}">Ver na planilha</a>"""
-        await update.message.reply_text(msg, parse_mode='HTML')
-    else:
+                await update.message.reply_text(msg, parse_mode='HTML')
+            else:
+                await update.message.reply_text(
+                    "❌ Erro ao registrar na planilha.\n"
+                    "Verifique se a conta de serviço tem acesso à planilha."
+                )
+            return
+
+    # 2. Usa IA para identificar intenção
+    intencao = detectar_intencao_ia(text)
+    acao = intencao.get("intencao", "perguntar")
+    mes = intencao.get("mes")
+    data_inicio = intencao.get("data_inicio")
+    data_fim = intencao.get("data_fim")
+    pessoa = intencao.get("pessoa")
+
+    # Monta args compatíveis com os handlers existentes
+    args = []
+    if mes:
+        args.append(mes)
+    if data_inicio:
+        args.append(data_inicio)
+    if data_fim:
+        args.append(data_fim)
+    if pessoa:
+        args.append(pessoa)
+
+    context.args = args
+
+    if acao == "fora_escopo":
         await update.message.reply_text(
-            "❌ Erro ao registrar na planilha.\n"
-            "Verifique se a conta de serviço tem acesso à planilha."
+            "🏠 Sou o assistente financeiro da <b>Finanças Casa MG</b>!\n\n"
+            "Só consigo ajudar com assuntos relacionados às finanças da casa. Tente:\n\n"
+            "• <i>faz o acerto de maio</i>\n"
+            "• <i>mostra o extrato de junho</i>\n"
+            "• <i>quanto gastamos esse mês</i>\n"
+            "• <i>quita os pendentes de maio</i>\n"
+            "• <i>gastei R$50 de mercado</i>\n\n"
+            "Ou use /ajuda para ver tudo que sei fazer! 😊",
+            parse_mode='HTML'
         )
+        return
+
+    handlers = {
+        "acerto":    acerto,
+        "extrato":   extrato,
+        "resumo":    resumo,
+        "quitar":    quitar,
+        "ajuda":     ajuda,
+        "perguntar": perguntar,
+    }
+
+    handler = handlers.get(acao, perguntar)
+    if acao == "perguntar":
+        context.args = text.split()
+    await handler(update, context)
 
 
 
