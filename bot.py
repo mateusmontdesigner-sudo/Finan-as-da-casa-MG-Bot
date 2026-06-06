@@ -96,7 +96,8 @@ _KEYWORDS_QUITAR  = {
     'quitar', 'quita ', 'marca como quitado', 'marcar quitado',
     'marcar como quitado', 'definir quitado', 'setar quitado',
     'quitar tudo', 'quita tudo', 'pagar tudo', 'zerar dividas',
-    'zerar dívidas', 'liquidar',
+    'zerar dívidas', 'liquidar', 'quita o', 'quita a', 'quitou',
+    'marca quitado', 'bota como quitado', 'coloca como quitado',
 }
 _KEYWORDS_HISTORICO = {
     'historico', 'histórico', 'ultimos gastos', 'últimos gastos',
@@ -392,16 +393,20 @@ class SheetsManager:
             logger.error(f"❌ Erro ao ler aba {nome_aba}: {e}")
             return None
 
-    def add_expense(self, quem_pagou, descricao, categoria, valor, divisao, quem_repassa):
+    def add_expense(self, quem_pagou, descricao, categoria, valor, divisao, quem_repassa, data_gasto=None):
         try:
             if not self.spreadsheet:
                 self._connect()
-            now = datetime.now()
-            nome_aba = MESES_PT[now.month]
+            if data_gasto is None:
+                data_gasto = datetime.now().date()
+            elif isinstance(data_gasto, str):
+                from datetime import date as _date
+                data_gasto = datetime.strptime(data_gasto, '%d/%m/%Y').date()
+            nome_aba = MESES_PT[data_gasto.month]
             ws = self._get_or_create_sheet(nome_aba)
             valor_pessoa = valor / divisao
             ws.append_row([
-                now.strftime('%d/%m/%Y'), quem_pagou, descricao, categoria,
+                data_gasto.strftime('%d/%m/%Y'), quem_pagou, descricao, categoria,
                 f'R$ {valor:.2f}'.replace('.', ','), divisao, quem_repassa,
                 f'R$ {valor_pessoa:.2f}'.replace('.', ','), 'Não Quitado', ''
             ])
@@ -523,7 +528,15 @@ class SheetsManager:
             'pessoa_filtro':     pessoa_filtro,
         }
 
-    def quitar_registros(self, nome_aba, data_inicio=None, data_fim=None):
+    def quitar_registros(self, nome_aba, data_inicio=None, data_fim=None,
+                          pessoa=None, categoria=None):
+        """
+        Quita registros de nome_aba filtrando por:
+          - data_inicio / data_fim  (opcional)
+          - pessoa    — quem pagou (opcional)
+          - categoria — categoria do gasto (opcional)
+        Retorna (qtd_quitados, total_nao_quitados_antes).
+        """
         try:
             if not self.spreadsheet:
                 self._connect()
@@ -539,14 +552,24 @@ class SheetsManager:
             for i, row in enumerate(rows[1:], start=2):
                 while len(row) < 9:
                     row.append('')
-                if row[8].strip() != 'Não Quitado':
+                status = row[8].strip().lower()
+                if status == 'quitado':
                     continue
                 total_nao_quitados += 1
+
                 data_row = parse_data(row[0])
                 if data_inicio and data_row and data_row < data_inicio:
                     continue
                 if data_fim and data_row and data_row > data_fim:
                     continue
+                if pessoa:
+                    pagador_row = normalizar(row[1])
+                    if normalizar(pessoa) not in pagador_row:
+                        continue
+                if categoria:
+                    cat_row = normalizar(row[3])
+                    if normalizar(categoria) not in cat_row:
+                        continue
                 atualizacoes.append(i)
 
             if not atualizacoes:
@@ -555,7 +578,7 @@ class SheetsManager:
             cell_list = [gspread.Cell(row=r, col=9, value='Quitado') for r in atualizacoes]
             ws.update_cells(cell_list, value_input_option='USER_ENTERED')
             logger.info(f"✅ {len(atualizacoes)} registros quitados em {nome_aba}")
-            self.invalidar_cache(nome_aba)   # força releitura na próxima consulta
+            self.invalidar_cache(nome_aba)
             return len(atualizacoes), total_nao_quitados
 
         except gspread.WorksheetNotFound:
@@ -571,6 +594,20 @@ class SheetsManager:
             if rows:
                 resultado[aba] = rows
         return resultado
+
+
+# ─── ESTADO DE CONVERSA (gastos incompletos aguardando info) ────
+# {chat_id: {user_id: {campo: valor, ...}}}
+_PENDING_GASTOS: dict = {}
+
+def _get_pending(chat_id, user_id) -> dict | None:
+    return _PENDING_GASTOS.get(chat_id, {}).get(user_id)
+
+def _set_pending(chat_id, user_id, data: dict):
+    _PENDING_GASTOS.setdefault(chat_id, {})[user_id] = data
+
+def _clear_pending(chat_id, user_id):
+    _PENDING_GASTOS.get(chat_id, {}).pop(user_id, None)
 
 
 sheets = SheetsManager()
@@ -632,47 +669,91 @@ async def _run(func, *args, **kwargs):
         raise
 
 
+# ─── REGEX PARA DATA NA MENSAGEM ────────────────────────────
+_REGEX_DATA_ABSOLUTA = [
+    # "dia 03/06", "03/06", "03/06/2026"
+    re.compile(r'(?:dia\s+)?(\d{1,2})[/\-](\d{1,2})(?:[/\-](\d{4}|\d{2}))?', re.I),
+]
+_PALAVRAS_DATA_RELATIVA = {
+    'ontem':     -1,
+    'anteontem': -2,
+    'ante-ontem': -2,
+}
+
+def _extrair_data_mensagem(text: str):
+    """Tenta extrair uma data explícita ou relativa da mensagem.
+    Retorna objeto date ou None (None = usar hoje)."""
+    tl = text.lower().strip()
+    hoje = date.today()
+    # Relativa: "ontem", "anteontem"
+    from datetime import timedelta
+    for palavra, delta in sorted(_PALAVRAS_DATA_RELATIVA.items(), key=lambda x: -len(x[0])):
+        if palavra in tl:
+            return hoje + timedelta(days=delta)
+    # Absoluta: "03/06", "dia 03/06/2026"
+    for pat in _REGEX_DATA_ABSOLUTA:
+        m = pat.search(tl)
+        if m:
+            dia = int(m.group(1))
+            mes = int(m.group(2))
+            ano_raw = m.group(3)
+            if ano_raw:
+                ano = int(ano_raw) if len(ano_raw) == 4 else 2000 + int(ano_raw)
+            else:
+                ano = hoje.year
+            try:
+                return date(ano, mes, dia)
+            except ValueError:
+                continue
+    return None
+
+
 # ─── DETECÇÃO LOCAL (sem Groq) ────────────────────────────────
 
 # Índices dos padrões de variação com ordem (desc, valor) em vez de (valor, desc)
-_REGEX_GASTOS_LEN = len(_REGEX_GASTOS)
-# _REGEX_VARIACAO_GASTO índices: 0=coloca, 1=reais, 2=custou(desc,val), 3=paguei_o(desc,val),
-#                                4=Nome pagou(val,desc), 5=desc val Nome pagou(desc,val)
+_REGEX_VARIACAO_LEN = len(_REGEX_VARIACAO_GASTO)
+# Nova ordem de avaliacao: _REGEX_VARIACAO_GASTO primeiro, depois _REGEX_GASTOS
+# _REGEX_VARIACAO_GASTO (indices 0..5): 0=coloca, 1=reais, 2=custou(desc,val),
+#   3=paguei_o(desc,val), 4=Nome pagou(val,desc), 5=desc val Nome pagou(desc,val)
+# _REGEX_GASTOS (indices _REGEX_VARIACAO_LEN..): offset 0=gastei, 1=paguei,
+#   2=comprei(desc,val), 3=R$(val,desc), 4=reais(val,desc), 5=cat(desc,val)
 
 def _detectar_gasto_regex(text: str, user_name: str) -> dict | None:
     """Tenta detectar gasto via regex puro. Retorna dict ou None."""
     tl = text.lower().strip()
 
-    todos_regex = _REGEX_GASTOS + _REGEX_VARIACAO_GASTO
+    # _REGEX_VARIACAO_GASTO vem PRIMEIRO para que "Nome pagou X de Y" seja capturado
+    # antes que o regex generico de R$ (em _REGEX_GASTOS) roube o match.
+    todos_regex = _REGEX_VARIACAO_GASTO + _REGEX_GASTOS
 
     for i, pat in enumerate(todos_regex):
         m = pat.search(tl)
         if not m:
             continue
 
-        n_variacao = i - _REGEX_GASTOS_LEN  # índice dentro de _REGEX_VARIACAO_GASTO (-1 se for _REGEX_GASTOS)
-
         try:
-            if i < _REGEX_GASTOS_LEN:
-                # _REGEX_GASTOS
-                if i == 2:      # "comprei DESC por VALOR"  → (desc, valor)
+            if i < _REGEX_VARIACAO_LEN:
+                # _REGEX_VARIACAO_GASTO
+                n_var = i
+                if n_var in (2, 3, 5):   # (desc, valor): custou / paguei_o / "desc val Nome pagou"
                     descricao_raw = m.group(1).strip().title()
                     valor = parse_valor(m.group(2))
-                elif i == 5:    # "categoria valor"          → (desc, valor)
-                    descricao_raw = m.group(1).strip().title()
-                    valor = parse_valor(m.group(2))
-                else:           # demais: (valor, desc)
+                elif n_var == 4:          # "Nome pagou VALOR de DESC" -> (valor, desc)
+                    valor = parse_valor(m.group(1))
+                    descricao_raw = m.group(2).strip().title()
+                else:                     # 0=coloca, 1=reais -> (valor, desc)
                     valor = parse_valor(m.group(1))
                     descricao_raw = m.group(2).strip().title()
             else:
-                # _REGEX_VARIACAO_GASTO
-                if n_variacao in (2, 3, 5):   # (desc, valor): custou / paguei_o / "desc val Nome pagou"
+                # _REGEX_GASTOS
+                n_gas = i - _REGEX_VARIACAO_LEN
+                if n_gas == 2:    # "comprei DESC por VALOR" -> (desc, valor)
                     descricao_raw = m.group(1).strip().title()
                     valor = parse_valor(m.group(2))
-                elif n_variacao == 4:          # "Nome pagou VALOR de DESC" → (valor, desc)
-                    valor = parse_valor(m.group(1))
-                    descricao_raw = m.group(2).strip().title()
-                else:                          # 0=coloca, 1=reais → (valor, desc)
+                elif n_gas == 5:  # "categoria valor" -> (desc, valor)
+                    descricao_raw = m.group(1).strip().title()
+                    valor = parse_valor(m.group(2))
+                else:             # demais: (valor, desc)
                     valor = parse_valor(m.group(1))
                     descricao_raw = m.group(2).strip().title()
         except Exception:
@@ -1196,32 +1277,76 @@ async def extrato(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(parte, parse_mode='HTML')
 
 
-async def quitar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = list(context.args)
+def _parse_quitar_args(args: list):
+    """
+    Extrai do args: nome_aba, data_inicio, data_fim, pessoa, categoria.
+    Aceita qualquer ordem:
+      /quitar MAIO Cristhian
+      /quitar MAIO 01/05 15/05 Marcelo
+      /quitar MAIO Supermercado
+      /quitar MAIO Mateus Açougue
+    """
     nome_aba, args = resolver_mes(args)
-
-    if not nome_aba:
-        await update.message.reply_text(
-            "❌ Informe o mês. Exemplo:\n/quitar MAIO\n/quitar MAIO 17/05 31/05"
-        )
-        return
-
-    datas = [d for d in (parse_data_arg(a) for a in args) if d]
+    datas, resto = [], []
+    for a in args:
+        d = parse_data_arg(a)
+        if d:
+            datas.append(d)
+        else:
+            resto.append(a)
     data_inicio = datas[0] if len(datas) >= 1 else None
     data_fim    = datas[1] if len(datas) >= 2 else None
 
+    pessoa    = None
+    categoria = None
+    for token in resto:
+        token_norm = normalizar(token)
+        # Testa se é um nome de pessoa
+        match_pessoa = next((p for p in PESSOAS if normalizar(p) == token_norm), None)
+        if match_pessoa:
+            pessoa = match_pessoa
+            continue
+        # Testa se é uma categoria
+        match_cat = next(
+            (v for k, v in CATEGORIA_MAP.items() if normalizar(v) == token_norm or normalizar(k) == token_norm),
+            None
+        )
+        if match_cat:
+            categoria = match_cat
+
+    return nome_aba, data_inicio, data_fim, pessoa, categoria
+
+
+async def quitar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = list(context.args)
+    nome_aba, data_inicio, data_fim, pessoa, categoria = _parse_quitar_args(args)
+
+    if not nome_aba:
+        await update.message.reply_text(
+            "❌ Informe o mês. Exemplos:\n"
+            "/quitar MAIO\n"
+            "/quitar MAIO 17/05 31/05\n"
+            "/quitar MAIO Cristhian\n"
+            "/quitar MAIO Supermercado\n"
+            "/quitar MAIO 01/05 15/05 Marcelo",
+            parse_mode='HTML'
+        )
+        return
+
     filtro_parts = []
-    if data_inicio:
-        filtro_parts.append(f"de {data_inicio.strftime('%d/%m')}")
-    if data_fim:
-        filtro_parts.append(f"até {data_fim.strftime('%d/%m')}")
+    if data_inicio: filtro_parts.append(f"de {data_inicio.strftime('%d/%m')}")
+    if data_fim:    filtro_parts.append(f"até {data_fim.strftime('%d/%m')}")
+    if pessoa:      filtro_parts.append(f"pago por {pessoa}")
+    if categoria:   filtro_parts.append(f"categoria {categoria}")
     filtro_str = f" ({', '.join(filtro_parts)})" if filtro_parts else ""
 
     await update.message.reply_text(
         f"⏳ Quitando registros de <b>{nome_aba}{filtro_str}</b>...", parse_mode='HTML'
     )
 
-    qtd, total = await _run(sheets.quitar_registros, nome_aba, data_inicio, data_fim)
+    qtd, total = await _run(
+        sheets.quitar_registros, nome_aba, data_inicio, data_fim, pessoa, categoria
+    )
 
     if qtd is None:
         abas = await _run(sheets.listar_abas)
@@ -1285,12 +1410,42 @@ def _limpar_mencao(text: str) -> str:
     return padrao.sub('', text).strip()
 
 
-def _deve_responder_no_grupo(update: Update) -> bool:
+def _parece_gasto(text: str) -> bool:
     """
-    Em grupos, o bot responde SOMENTE se:
-    1. A mensagem menciona @bot_username
-    2. A mensagem é uma resposta (reply) a uma mensagem do próprio bot
-    3. É uma mensagem privada (chat individual)
+    Heurística rápida: a mensagem parece um registro de gasto?
+    Usada para decidir se o bot processa mensagens de grupo sem @mencao.
+    """
+    tl = text.lower().strip()
+    # Tem número (valor) na mensagem?
+    tem_numero = bool(re.search(r'\d+[,.]?\d*', tl))
+    if not tem_numero:
+        return False
+    # Tem nome de pessoa?
+    tem_pessoa = any(p.lower() in tl for p in PESSOAS)
+    # Tem palavra de ação financeira?
+    tem_acao = bool(re.search(
+        r'\b(paguei|pagou|gastei|gastou|comprei|comprou|coloca|adiciona|registra|bota)\b', tl
+    ))
+    # Tem categoria/descrição conhecida?
+    tem_categoria = any(normalizar(k) in normalizar(tl) for k in CATEGORIA_MAP)
+    # Tem R$ explícito?
+    tem_rs = bool(re.search(r'r\$', tl))
+    # Considera gasto se: (tem ação OU tem R$) E tem número
+    # OU: tem pessoa + número + categoria (ex: "Cristhian 109 internet")
+    # OU: começa com categoria conhecida + número (ex: "mercado 87,50")
+    padrao_cat_valor = bool(re.search(
+        r'^(' + '|'.join(re.escape(k) for k in sorted(CATEGORIA_MAP.keys(), key=len, reverse=True)) + r')\s+[\d,.]',
+        tl, re.IGNORECASE | re.UNICODE
+    ))
+    return (tem_acao or tem_rs) or (tem_pessoa and tem_categoria) or padrao_cat_valor
+
+
+def _deve_responder_no_grupo(update: Update, para_gasto: bool = False) -> bool:
+    """
+    Em grupos:
+    - para_gasto=True : responde SEMPRE (registros não precisam de @mencao)
+    - para_gasto=False: só responde se @mencionado, reply ao bot, ou /comando
+    Conversa privada: sempre responde.
     """
     msg = update.message
     if not msg:
@@ -1300,7 +1455,7 @@ def _deve_responder_no_grupo(update: Update) -> bool:
     if msg.chat.type == 'private':
         return True
 
-    # Reply a uma mensagem do bot → responde
+    # Reply a uma mensagem do bot → sempre responde (continuação de conversa)
     if msg.reply_to_message and msg.reply_to_message.from_user:
         if msg.reply_to_message.from_user.is_bot:
             return True
@@ -1318,7 +1473,36 @@ def _deve_responder_no_grupo(update: Update) -> bool:
                 if BOT_USERNAME and mention_text.lower() == f'@{BOT_USERNAME}'.lower():
                     return True
 
+    # Registros de gasto no grupo não precisam de @mencao
+    if para_gasto and msg.text:
+        return True
+
     return False
+
+
+async def _registrar_gasto_confirmado(msg, pagador, descricao, categoria, valor, data_gasto):
+    """Registra o gasto na planilha e envia confirmação."""
+    divisao, quem_repassa = calcular_divisao(categoria, pagador)
+    success, vp = await _run(sheets.add_expense, pagador, descricao, categoria, valor, divisao, quem_repassa, data_gasto)
+    data_str = data_gasto.strftime('%d/%m/%Y') if data_gasto else datetime.now().strftime('%d/%m/%Y')
+    if success:
+        await msg.reply_text(
+            f"✅ <b>GASTO REGISTRADO!</b>\n\n"
+            f"👤 <b>Pago por:</b> {pagador}\n"
+            f"📝 <b>Descrição:</b> {descricao}\n"
+            f"🏷️ <b>Categoria:</b> {categoria}\n"
+            f"💰 <b>Total:</b> R$ {valor:.2f}\n"
+            f"👥 <b>Divisão:</b> {divisao} pessoas → R$ {vp:.2f} cada\n"
+            f"🔄 <b>Repassar:</b> {quem_repassa}\n"
+            f"📅 <b>Data:</b> {data_str}\n\n"
+            f'📊 <a href="{SHEET_URL}">Ver na planilha</a>',
+            parse_mode='HTML'
+        )
+    else:
+        await msg.reply_text(
+            "❌ Erro ao registrar na planilha.\n"
+            "Verifique se a conta de serviço tem acesso."
+        )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1326,18 +1510,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.text:
         return
 
-    # Em grupos: ignora se não foi chamado
-    if not _deve_responder_no_grupo(update):
-        return
-
     # Remove a menção do início para processar o texto limpo
     text = _limpar_mencao(msg.text)
+    chat_id = msg.chat_id
+    user_id = msg.from_user.id if msg.from_user else 0
+    user_name = identify_user(update)
+
+    # Em grupos: verifica se deve responder
+    if msg.chat.type != 'private':
+        # Há um gasto pendente aguardando resposta? Sempre processa o reply.
+        pendente_ativo = _get_pending(chat_id, user_id)
+        # Parece um registro de gasto? Processa sem precisar de @mencao.
+        eh_gasto = _parece_gasto(text) if text else False
+        # Não é gasto e não foi chamado → ignora
+        if not pendente_ativo and not eh_gasto and not _deve_responder_no_grupo(update):
+            return
+
     if not text:
-        # Mencionaram o bot sem dizer nada — mostra ajuda rápida
-        nome = identify_user(update)
         mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "o bot"
         await msg.reply_text(
-            f"👋 Oi, <b>{nome}</b>! Me chame com uma mensagem, por exemplo:\n"
+            f"👋 Oi, <b>{user_name}</b>! Me chame com uma mensagem, por exemplo:\n"
             f"<i>{mention} gastei R$50 de mercado</i>\n"
             f"<i>{mention} faz o acerto de maio</i>\n\n"
             f"Use /ajuda para ver tudo que posso fazer.",
@@ -1345,7 +1537,97 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    user_name = identify_user(update)
+    # ── Verifica se há um gasto pendente aguardando complemento ──
+    pendente = _get_pending(chat_id, user_id)
+    if pendente:
+        tl = text.lower().strip()
+
+        # Cancelamento
+        if tl in {'cancelar', 'cancel', 'não', 'nao', 'n'}:
+            _clear_pending(chat_id, user_id)
+            await msg.reply_text("❌ Registro cancelado.")
+            return
+
+        campo_faltante = pendente.get('aguardando')
+
+        # ── Aguardando VALOR ──
+        if campo_faltante == 'valor':
+            valor = parse_valor(text)
+            if valor <= 0:
+                await msg.reply_text("⚠️ Não entendi o valor. Me diga só o número, ex: <b>87,50</b>", parse_mode='HTML')
+                return
+            pendente['valor'] = valor
+            del pendente['aguardando']
+            _clear_pending(chat_id, user_id)
+            await _registrar_gasto_confirmado(
+                msg,
+                pendente['pagador'], pendente['descricao'],
+                pendente['categoria'], pendente['valor'], pendente.get('data_gasto')
+            )
+            return
+
+        # ── Aguardando PAGADOR ──
+        if campo_faltante == 'pagador':
+            # Checa se digitou um nome ou número de opção
+            opcoes = pendente.get('opcoes_pagador', PESSOAS)
+            pagador = None
+            if tl.isdigit():
+                idx = int(tl) - 1
+                if 0 <= idx < len(opcoes):
+                    pagador = opcoes[idx]
+            else:
+                for p in PESSOAS:
+                    if p.lower() in tl or tl in p.lower():
+                        pagador = p
+                        break
+            if not pagador:
+                opcoes_str = '\n'.join(f'{i+1}. {p}' for i, p in enumerate(opcoes))
+                await msg.reply_text(
+                    f"❓ Não reconheci o pagador. Digite o número ou nome:\n{opcoes_str}",
+                    parse_mode='HTML'
+                )
+                return
+            pendente['pagador'] = pagador
+            del pendente['aguardando']
+            _clear_pending(chat_id, user_id)
+            await _registrar_gasto_confirmado(
+                msg,
+                pendente['pagador'], pendente['descricao'],
+                pendente['categoria'], pendente['valor'], pendente.get('data_gasto')
+            )
+            return
+
+        # ── Aguardando CATEGORIA ──
+        if campo_faltante == 'categoria':
+            cats = sorted(set(CATEGORIA_MAP.values()))
+            cat = None
+            tl_norm = normalizar(text)
+            for c in cats:
+                if normalizar(c) in tl_norm or tl_norm in normalizar(c):
+                    cat = c
+                    break
+            if tl.isdigit():
+                idx = int(tl) - 1
+                if 0 <= idx < len(cats):
+                    cat = cats[idx]
+            if not cat:
+                await msg.reply_text(
+                    "❓ Não reconheci a categoria. Tente digitar o nome, ex: <b>Supermercado</b>",
+                    parse_mode='HTML'
+                )
+                return
+            pendente['categoria'] = cat
+            del pendente['aguardando']
+            _clear_pending(chat_id, user_id)
+            await _registrar_gasto_confirmado(
+                msg,
+                pendente['pagador'], pendente['descricao'],
+                pendente['categoria'], pendente['valor'], pendente.get('data_gasto')
+            )
+            return
+
+        # Mensagem não reconhecida como resposta — limpa pendente e processa normalmente
+        _clear_pending(chat_id, user_id)
 
     # ── 1. Regex local (sem Groq) ────────────────────────────
     resultado = _detectar_gasto_regex(text, user_name)
@@ -1366,33 +1648,63 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         descricao = resultado.get('descricao', '')
         categoria = resultado.get('categoria', 'Outros')
         valor     = float(resultado.get('valor', 0))
+        data_gasto = _extrair_data_mensagem(text)
 
-        if valor <= 0:
+        # ── Pagador não identificado na mensagem → pergunta ──
+        pagador_identificado = resultado.get('pagador') is not None and resultado.get('pagador') != user_name
+        # Só pergunta se veio de grupo E o pagador não aparece explicitamente na mensagem
+        nenhum_nome_na_msg = not any(p.lower() in text.lower() for p in PESSOAS)
+        if msg.chat.type != 'private' and nenhum_nome_na_msg:
+            opcoes = PESSOAS
+            opcoes_str = '\n'.join(f'{i+1}. {p}' for i, p in enumerate(opcoes))
+            _set_pending(chat_id, user_id, {
+                'pagador': pagador, 'descricao': descricao,
+                'categoria': categoria, 'valor': valor,
+                'data_gasto': data_gasto,
+                'aguardando': 'pagador',
+                'opcoes_pagador': opcoes,
+            })
             await msg.reply_text(
-                "⚠️ Não consegui identificar o valor.\nTente: \"gastei R$50 de mercado\""
+                f"❓ Quem pagou? Digite o número ou nome:\n{opcoes_str}\n\n"
+                f"<i>(ou 'cancelar' para desistir)</i>",
+                parse_mode='HTML'
             )
             return
 
-        divisao, quem_repassa = calcular_divisao(categoria, pagador)
-        success, vp = await _run(sheets.add_expense, pagador, descricao, categoria, valor, divisao, quem_repassa)
-        if success:
+        # ── Valor ausente → pergunta ──
+        if valor <= 0:
+            _set_pending(chat_id, user_id, {
+                'pagador': pagador, 'descricao': descricao,
+                'categoria': categoria, 'valor': 0,
+                'data_gasto': data_gasto,
+                'aguardando': 'valor',
+            })
             await msg.reply_text(
-                f"✅ <b>GASTO REGISTRADO!</b>\n\n"
-                f"👤 <b>Pago por:</b> {pagador}\n"
-                f"📝 <b>Descrição:</b> {descricao}\n"
-                f"🏷️ <b>Categoria:</b> {categoria}\n"
-                f"💰 <b>Total:</b> R$ {valor:.2f}\n"
-                f"👥 <b>Divisão:</b> {divisao} pessoas → R$ {vp:.2f} cada\n"
-                f"🔄 <b>Repassar:</b> {quem_repassa}\n"
-                f"📅 <b>Data:</b> {datetime.now().strftime('%d/%m/%Y')}\n\n"
-                f'📊 <a href="{SHEET_URL}">Ver na planilha</a>',
+                f"❓ Qual foi o valor de <b>{descricao or 'esse gasto'}</b>?\n"
+                f"<i>(ex: 87,50 ou 'cancelar')</i>",
                 parse_mode='HTML'
             )
-        else:
+            return
+
+        # ── Categoria 'Outros' → confirma com opções ──
+        if categoria == 'Outros':
+            cats = sorted(set(CATEGORIA_MAP.values()))
+            cats_str = '\n'.join(f'{i+1}. {c}' for i, c in enumerate(cats))
+            _set_pending(chat_id, user_id, {
+                'pagador': pagador, 'descricao': descricao,
+                'categoria': 'Outros', 'valor': valor,
+                'data_gasto': data_gasto,
+                'aguardando': 'categoria',
+            })
             await msg.reply_text(
-                "❌ Erro ao registrar na planilha.\n"
-                "Verifique se a conta de serviço tem acesso."
+                f"❓ Não reconheci a categoria de <b>{descricao}</b>.\n"
+                f"Qual é a categoria? (número ou nome)\n\n{cats_str}\n\n"
+                f"<i>(ou 'cancelar')</i>",
+                parse_mode='HTML'
             )
+            return
+
+        await _registrar_gasto_confirmado(msg, pagador, descricao, categoria, valor, data_gasto)
         return
 
     # ── Processar INTENÇÃO ────────────────────────────────────
