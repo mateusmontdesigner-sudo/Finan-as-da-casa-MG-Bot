@@ -346,15 +346,31 @@ class SheetsManager:
             for row in raw[1:]:
                 while len(row) < 10:
                     row.append('')
+                # Normaliza nomes do pagador para bater com PESSOAS
+                pagador_raw = row[1].strip()
+                pagador_norm = next(
+                    (p for p in PESSOAS if normalizar(p) in normalizar(pagador_raw)
+                     or normalizar(pagador_raw) in normalizar(p)),
+                    pagador_raw
+                )
+                repassa_raw = [p.strip() for p in row[6].split(',') if p.strip()]
+                repassa_norm = []
+                for rp in repassa_raw:
+                    match = next(
+                        (p for p in PESSOAS if normalizar(p) in normalizar(rp)
+                         or normalizar(rp) in normalizar(p)),
+                        rp
+                    )
+                    repassa_norm.append(match)
                 result.append({
                     'data_str':   row[0],
                     'data':       parse_data(row[0]),
-                    'pagador':    row[1].strip(),
+                    'pagador':    pagador_norm,
                     'descricao':  row[2].strip() or row[3].strip(),
                     'categoria':  row[3].strip(),
                     'valor':      parse_valor(row[4]),
                     'divisao':    int(row[5]) if row[5].strip().isdigit() else 3,
-                    'repassa':    [p.strip() for p in row[6].split(',') if p.strip()],
+                    'repassa':    repassa_norm,
                     'val_pessoa': parse_valor(row[7]),
                     'quitacao':   row[8].strip().lower(),
                 })
@@ -417,6 +433,7 @@ class SheetsManager:
         if rows is None:
             return None
 
+        logger.info(f"[ACERTO] {nome_aba}: {len(rows)} registros lidos, apenas_nao_quitados={apenas_nao_quitados}")
         filtrados = []
         for r in rows:
             if apenas_nao_quitados:
@@ -429,6 +446,7 @@ class SheetsManager:
                 continue
             filtrados.append(r)
 
+        logger.info(f"[ACERTO] {nome_aba}: {len(filtrados)} itens após filtro | pagadores: {list(set(r['pagador'] for r in filtrados))}")
         saldo = {p: {q: 0.0 for q in PESSOAS} for p in PESSOAS}
         detalhes_por_item = []
 
@@ -1368,6 +1386,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handler_map.get(acao, perguntar)(update, context)
 
 
+
+async def debug_acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnóstico: mostra exatamente o que o bot lê da planilha para o acerto."""
+    args = list(context.args)
+    nome_aba, _ = resolver_mes(args)
+    if not nome_aba:
+        nome_aba = MESES_PT[datetime.now().month]
+
+    await update.message.reply_text(f"🔍 Lendo aba '{nome_aba}'...")
+    rows = await _run(sheets.get_rows, nome_aba)
+
+    if rows is None:
+        await update.message.reply_text("❌ Aba não encontrada.")
+        return
+
+    nao_quitados = [r for r in rows if not ('quitado' in r['quitacao'] and 'não' not in r['quitacao'] and 'nao' not in r['quitacao'])]
+
+    msg = f"📋 <b>DEBUG ACERTO — {nome_aba}</b>\n"
+    msg += f"Total lido: {len(rows)} | Não quitados: {len(nao_quitados)}\n\n"
+
+    for r in nao_quitados:
+        repassa_ok = [p for p in r['repassa'] if p in PESSOAS]
+        repassa_fora = [p for p in r['repassa'] if p not in PESSOAS]
+        pagador_ok = "✅" if r['pagador'] in PESSOAS else "❌"
+        msg += (
+            f"• {r['data_str']} | pag: {pagador_ok}<b>{r['pagador']}</b> "
+            f"| R${r['valor']:.2f} ÷{r['divisao']}\n"
+            f"  repassa: {repassa_ok}"
+            + (f" ⚠️FORA: {repassa_fora}" if repassa_fora else "")
+            + f" | quitacao: '{r['quitacao']}'\n"
+        )
+
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n... (truncado)"
+
+    await update.message.reply_text(msg, parse_mode='HTML')
+
 # ─── MAIN ─────────────────────────────────────────────────────
 
 def _diagnostico_startup():
@@ -1435,6 +1490,7 @@ def main():
     app.add_handler(CommandHandler("extrato",   extrato))
     app.add_handler(CommandHandler("quitar",    quitar))
     app.add_handler(CommandHandler("perguntar", perguntar))
+    app.add_handler(CommandHandler("debug",     debug_acerto))
     # Texto livre — privado e grupos
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND,
