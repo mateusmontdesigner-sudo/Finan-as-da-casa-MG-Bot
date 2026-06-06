@@ -125,6 +125,10 @@ _REGEX_VARIACAO_GASTO = [
     re.compile(r'(.+?)\s+(?:custou|saiu|foi)\s+r?\$?\s*([\d.,]+)', re.I),
     # "paguei o Y de X" / "paguei a Y de X"
     re.compile(r'paguei\s+(?:o|a|os|as)\s+(.+?)\s+(?:de|da|do|por)\s+r?\$?\s*([\d.,]+)', re.I),
+    # "Cristhian pagou 109 de internet" / "Marcelo pagou 50 luz"
+    re.compile(r'(?:cristhian|mateus|marcelo|eli)\s+(?:pagou|gastou|comprou)\s+r?\$?\s*([\d.,]+)\s*(?:de|da|do|com|no|na|\s)\s*(.+)', re.I),
+    # "internet 109 Cristhian pagou" / "mercado 87 marcelo pagou"
+    re.compile(r'^(.+?)\s+([\d.,]+)\s+(?:cristhian|mateus|marcelo|eli)\s+pagou', re.I),
 ]
 
 # ── Regex para gastos sem IA ──────────────────────────────────
@@ -470,7 +474,7 @@ class SheetsManager:
                 for pagador in pagadores:
                     if pagador in PESSOAS and pagador != devedor:
                         saldo[devedor][pagador] += val_parte
-                devedores.append((devedor, val_parte * len(pagadores)))
+                devedores.append((devedor, val_parte))
             if devedores:
                 detalhes_por_item.append({
                     'data':        r['data_str'] or 'sem data',
@@ -664,13 +668,26 @@ def _detectar_gasto_regex(text: str, user_name: str) -> dict | None:
         if valor <= 0:
             continue
 
-        # Detecta se outra pessoa foi mencionada como pagadora
+        # Detecta pagador — procura "Nome pagou/gastou" em qualquer posição do texto
         pagador = user_name
         for nome in PESSOAS:
-            if nome.lower() in tl and nome != user_name:
+            if nome.lower() in tl:
                 if re.search(rf'\b{nome.lower()}\b\s+(?:pagou|gastou|comprou|colocou|lancou|lançou)', tl):
                     pagador = nome
                     break
+                # Também detecta início da frase: "Cristhian pagou X de Y"
+                if re.match(rf'^{nome.lower()}\b', tl):
+                    pagador = nome
+                    break
+
+        # Limpa nome do pagador da descrição (ex: "Internet Cristhian Pagou" → "Internet")
+        descricao_limpa = descricao_raw
+        for nome in PESSOAS:
+            descricao_limpa = re.sub(rf'\b{re.escape(nome)}\b', '', descricao_limpa, flags=re.I).strip()
+        descricao_limpa = re.sub(r'\b(?:pagou|gastou|comprou|colocou|lancou)\b', '', descricao_limpa, flags=re.I).strip()
+        descricao_limpa = re.sub(r'\s{2,}', ' ', descricao_limpa).strip(' ,-')
+        if descricao_limpa:
+            descricao_raw = descricao_limpa.title()
 
         return {
             'tipo':      'gasto',
