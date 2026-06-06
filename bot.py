@@ -420,6 +420,34 @@ class SheetsManager:
             if next_row > 50:
                 logger.warning("⚠️ Região de dados cheia (A2:J50). Usando linha seguinte.")
 
+            # Copia formato da linha anterior para manter visual consistente
+            # (menus suspensos, cores, bordas)
+            if next_row > 2:
+                try:
+                    sheet_id = ws.id
+                    body = {"requests": [{
+                        "copyPaste": {
+                            "source": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": next_row - 2,
+                                "endRowIndex": next_row - 1,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": 10
+                            },
+                            "destination": {
+                                "sheetId": sheet_id,
+                                "startRowIndex": next_row - 1,
+                                "endRowIndex": next_row,
+                                "startColumnIndex": 0,
+                                "endColumnIndex": 10
+                            },
+                            "pasteType": "PASTE_FORMAT"
+                        }
+                    }]}
+                    self.spreadsheet.batch_update(body)
+                except Exception as e:
+                    logger.warning(f"⚠️ Não foi possível copiar formato: {e}")
+
             ws.update(f'A{next_row}:J{next_row}', [[
                 data_gasto.strftime('%d/%m/%Y'), quem_pagou, descricao, categoria,
                 f'R$ {valor:.2f}'.replace('.', ','), divisao, quem_repassa,
@@ -535,6 +563,111 @@ class SheetsManager:
 
         return {
             'mes':               nome_display,
+            'transferencias':    transferencias,
+            'detalhes_por_item': detalhes_por_item,
+            'filtro_periodo':    (data_inicio, data_fim),
+            'apenas_nao_quitados': apenas_nao_quitados,
+            'total_itens':       len(filtrados),
+            'pessoa_filtro':     pessoa_filtro,
+        }
+
+
+    def get_acerto_periodo(self, data_inicio, data_fim, apenas_nao_quitados=True, pessoa_filtro=None):
+        """
+        Acerto para períodos que podem cruzar múltiplos meses.
+        Ex: 17/05 a 02/06 — lê MAIO e JUNHO e combina os dados.
+        """
+        from datetime import date
+
+        # Descobre quais meses estão no intervalo
+        meses_intervalo = []
+        mes_atual = date(data_inicio.year, data_inicio.month, 1)
+        mes_fim = date(data_fim.year, data_fim.month, 1)
+        while mes_atual <= mes_fim:
+            meses_intervalo.append(MESES_PT[mes_atual.month])
+            # Avança um mês
+            if mes_atual.month == 12:
+                mes_atual = date(mes_atual.year + 1, 1, 1)
+            else:
+                mes_atual = date(mes_atual.year, mes_atual.month + 1, 1)
+
+        # Lê todos os registros dos meses relevantes
+        todos_rows = []
+        meses_lidos = []
+        for mes in meses_intervalo:
+            rows = self.get_rows(mes)
+            if rows:
+                todos_rows.extend(rows)
+                meses_lidos.append(mes)
+
+        if not todos_rows:
+            return None
+
+        # Filtra pelo período exato
+        filtrados = []
+        for r in todos_rows:
+            if apenas_nao_quitados:
+                q = r['quitacao']
+                if 'quitado' in q and 'não' not in q and 'nao' not in q:
+                    continue
+            if r['data'] and r['data'] < data_inicio:
+                continue
+            if r['data'] and r['data'] > data_fim:
+                continue
+            filtrados.append(r)
+
+        saldo = {p: {q: 0.0 for q in PESSOAS} for p in PESSOAS}
+        detalhes_por_item = []
+
+        for r in filtrados:
+            pagadores = [p.strip() for p in r['pagador'].split(',') if p.strip()]
+            val_parte = r['valor'] / r['divisao'] if r['divisao'] else r['valor']
+            devedores = []
+            for devedor in r['repassa']:
+                if devedor not in PESSOAS or devedor in pagadores:
+                    continue
+                for pagador in pagadores:
+                    if pagador in PESSOAS and pagador != devedor:
+                        saldo[devedor][pagador] += val_parte
+                devedores.append((devedor, val_parte))
+            if devedores:
+                detalhes_por_item.append({
+                    'data':        r['data_str'] or 'sem data',
+                    'pagador':     r['pagador'],
+                    'descricao':   r['descricao'] or r['categoria'],
+                    'valor_total': r['valor'],
+                    'valor_parte': val_parte,
+                    'devedores':   devedores,
+                })
+
+        transferencias = []
+        processados = set()
+        for a in PESSOAS:
+            for b in PESSOAS:
+                if a >= b or (a, b) in processados:
+                    continue
+                processados.add((a, b))
+                liquido = saldo[a][b] - saldo[b][a]
+                if liquido > 0.01:
+                    transferencias.append((a, b, liquido))
+                elif liquido < -0.01:
+                    transferencias.append((b, a, -liquido))
+
+        if pessoa_filtro:
+            transferencias = [(de, para, val) for de, para, val in transferencias
+                              if de == pessoa_filtro or para == pessoa_filtro]
+            detalhes_por_item = [item for item in detalhes_por_item
+                                 if item['pagador'] == pessoa_filtro or
+                                 any(d == pessoa_filtro for d, _ in item['devedores'])]
+
+        periodo_str = f"{data_inicio.strftime('%d/%m')} a {data_fim.strftime('%d/%m')}"
+        if len(meses_lidos) > 1:
+            label = ' + '.join(meses_lidos)
+        else:
+            label = meses_lidos[0] if meses_lidos else ''
+
+        return {
+            'mes':               f"{label} ({periodo_str})",
             'transferencias':    transferencias,
             'detalhes_por_item': detalhes_por_item,
             'filtro_periodo':    (data_inicio, data_fim),
@@ -1115,7 +1248,15 @@ async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ Calculando acerto...")
     try:
-        data = await _run(sheets.get_acerto, nome_aba, data_inicio, data_fim, True, pessoa_filtro)
+        # Se período cruza meses (ex: 17/05 a 02/06), usa método multi-mês
+        periodo_multi_mes = (
+            data_inicio and data_fim and
+            (data_inicio.month != data_fim.month or data_inicio.year != data_fim.year)
+        )
+        if periodo_multi_mes:
+            data = await _run(sheets.get_acerto_periodo, data_inicio, data_fim, True, pessoa_filtro)
+        else:
+            data = await _run(sheets.get_acerto, nome_aba, data_inicio, data_fim, True, pessoa_filtro)
     except asyncio.TimeoutError:
         await update.message.reply_text("❌ Tempo esgotado ao acessar a planilha. Tente novamente em alguns segundos.")
         return
