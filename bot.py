@@ -234,6 +234,9 @@ class SheetsManager:
         self.client = None
         self.spreadsheet = None
         self._cache: dict = {}          # {nome_aba: (timestamp, rows)}
+        self._abas_cache: dict = {}     # {NOME_NORMALIZADO: nome_real} — evita roundtrip duplo
+        self._abas_cache_ts: float = 0
+        self._ABAS_CACHE_TTL = 120      # segundos
         self._connect()
 
     def _connect(self):
@@ -274,45 +277,56 @@ class SheetsManager:
             ])
             return ws
 
-    def listar_abas(self) -> list:
-        """Retorna os títulos reais das abas que correspondem a meses."""
+    def _atualizar_cache_abas(self):
+        """Atualiza o mapeamento normalizado→real das abas. TTL de 2 minutos."""
+        if time.time() - self._abas_cache_ts < self._ABAS_CACHE_TTL and self._abas_cache:
+            return
         try:
             if not self.spreadsheet:
                 self._connect()
             abas = self.spreadsheet.worksheets()
-            logger.info(f"📋 Abas encontradas: {[ws.title for ws in abas]}")
-            return [ws.title for ws in abas if normalizar(ws.title) in MESES_NOMES]
+            self._abas_cache = {normalizar(ws.title): ws.title for ws in abas}
+            self._abas_cache_ts = time.time()
+            logger.info(f"📋 Cache de abas atualizado: {list(self._abas_cache.values())}")
+        except Exception as e:
+            logger.error(f"❌ Erro ao atualizar cache de abas: {e}")
+
+    def listar_abas(self) -> list:
+        """Retorna os títulos reais das abas que correspondem a meses."""
+        try:
+            self._atualizar_cache_abas()
+            return [v for k, v in self._abas_cache.items() if k in MESES_NOMES]
         except Exception as e:
             logger.error(f"❌ Erro ao listar abas: {e}")
             return []
 
     def resolver_nome_aba(self, nome_mes_normalizado: str) -> str | None:
         """Dado 'MAIO', retorna o título real da aba (ex: 'Maio', 'maio', 'MAIO')."""
-        try:
-            if not self.spreadsheet:
-                self._connect()
-            for ws in self.spreadsheet.worksheets():
-                if normalizar(ws.title) == nome_mes_normalizado:
-                    return ws.title
-            return None
-        except Exception as e:
-            logger.error(f"❌ Erro ao resolver nome da aba: {e}")
-            return None
+        self._atualizar_cache_abas()
+        return self._abas_cache.get(nome_mes_normalizado)
 
     def invalidar_cache(self, nome_aba: str = None):
         """Invalida cache de uma aba específica ou de todas."""
         if nome_aba:
             self._cache.pop(nome_aba, None)
+            # Invalida também pelo nome normalizado, caso seja a chave usada
+            nome_norm = normalizar(nome_aba)
+            nome_real = self._abas_cache.get(nome_norm, nome_aba)
+            self._cache.pop(nome_real, None)
         else:
             self._cache.clear()
+        # Força atualização do cache de abas na próxima chamada
+        self._abas_cache_ts = 0
 
     def get_rows(self, nome_aba: str):
         try:
             if not self.spreadsheet:
                 self._connect()
 
-            # Resolve o nome real da aba (a planilha pode ter 'Maio' em vez de 'MAIO')
-            nome_real = self.resolver_nome_aba(nome_aba) or nome_aba
+            # Resolve o nome real da aba usando o cache interno (sem roundtrip extra)
+            nome_norm = normalizar(nome_aba)
+            self._atualizar_cache_abas()
+            nome_real = self._abas_cache.get(nome_norm) or nome_aba
 
             # Retorna do cache se ainda válido
             entrada = self._cache.get(nome_real)
@@ -343,7 +357,7 @@ class SheetsManager:
                     'quitacao':   row[8].strip().lower(),
                 })
             final = [r for r in result if r['valor'] > 0]
-            self._cache[nome_aba] = (time.time(), final)   # salva no cache
+            self._cache[nome_real] = (time.time(), final)   # chave = nome_real (consistente)
             return final
         except gspread.WorksheetNotFound:
             return None
@@ -396,7 +410,7 @@ class SheetsManager:
                    apenas_nao_quitados=True, pessoa_filtro=None):
         if not nome_aba:
             nome_aba = MESES_PT[datetime.now().month]
-        nome_aba = self.resolver_nome_aba(nome_aba) or nome_aba
+        # get_rows já resolve o nome real internamente — sem roundtrip duplo
         rows = self.get_rows(nome_aba)
         if rows is None:
             return None
@@ -458,8 +472,12 @@ class SheetsManager:
                 any(d == pessoa_filtro for d, _ in item['devedores'])
             ]
 
+        # Determina o nome real (já foi resolvido em get_rows via cache de abas)
+        nome_norm = normalizar(nome_aba)
+        nome_display = self._abas_cache.get(nome_norm, nome_aba)
+
         return {
-            'mes':               nome_aba,
+            'mes':               nome_display,
             'transferencias':    transferencias,
             'detalhes_por_item': detalhes_por_item,
             'filtro_periodo':    (data_inicio, data_fim),
