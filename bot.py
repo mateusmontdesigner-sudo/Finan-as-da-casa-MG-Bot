@@ -42,9 +42,9 @@ MESES_NOMES = set(MESES_PT.values())
 
 USER_MAPPING = {
     'mateus': 'Mateus', 'cristhian': 'Cristhian',
-    'marcelo': 'Marcelo', 'eli': 'Eli'
+    'marcelo': 'Marcelo'
 }
-PESSOAS = ['Mateus', 'Cristhian', 'Marcelo', 'Eli']
+PESSOAS = ['Mateus', 'Cristhian', 'Marcelo']
 
 CATEGORIA_MAP = {
     'mercado': 'Supermercado', 'supermercado': 'Supermercado',
@@ -127,9 +127,9 @@ _REGEX_VARIACAO_GASTO = [
     # "paguei o Y de X" / "paguei a Y de X"
     re.compile(r'paguei\s+(?:o|a|os|as)\s+(.+?)\s+(?:de|da|do|por)\s+r?\$?\s*([\d.,]+)', re.I),
     # "Cristhian pagou 109 de internet" / "Marcelo pagou 50 luz"
-    re.compile(r'(?:cristhian|mateus|marcelo|eli)\s+(?:pagou|gastou|comprou)\s+r?\$?\s*([\d.,]+)\s*(?:de|da|do|com|no|na|\s)\s*(.+)', re.I),
+    re.compile(r'(?:cristhian|mateus|marcelo)\s+(?:pagou|gastou|comprou)\s+r?\$?\s*([\d.,]+)\s*(?:de|da|do|com|no|na|\s)\s*(.+)', re.I),
     # "internet 109 Cristhian pagou" / "mercado 87 marcelo pagou"
-    re.compile(r'^(.+?)\s+([\d.,]+)\s+(?:cristhian|mateus|marcelo|eli)\s+pagou', re.I),
+    re.compile(r'^(.+?)\s+([\d.,]+)\s+(?:cristhian|mateus|marcelo)\s+pagou', re.I),
 ]
 
 # ── Regex para gastos sem IA ──────────────────────────────────
@@ -195,7 +195,7 @@ def detectar_categoria(descricao: str) -> str:
 def calcular_divisao(categoria: str, quem_pagou: str):
     cat_norm = normalizar(categoria)
     if any(c in cat_norm for c in ['AGUA', 'LUZ', 'ENERGIA']):
-        divisao, todos = 4, list(PESSOAS)
+        divisao, todos = 3, ['Mateus', 'Cristhian', 'Marcelo']
     elif any(c in cat_norm for c in ['GATA', 'VETERINARIO']):
         divisao, todos = 2, ['Mateus', 'Cristhian']
     else:
@@ -345,7 +345,7 @@ class SheetsManager:
             ws = self.spreadsheet.worksheet(nome_real)
             logger.info(f"📡 Buscando dados da aba '{nome_real}' no Sheets...")
             t0 = time.time()
-            raw = ws.get_all_values()
+            raw = ws.get('A1:J200') or []  # Lê só A:J, ignora notas nas colunas L+
             logger.info(f"✅ Sheets respondeu em {time.time()-t0:.2f}s — {len(raw)} linhas")
             result = []
             for row in raw[1:]:
@@ -405,11 +405,26 @@ class SheetsManager:
             nome_aba = MESES_PT[data_gasto.month]
             ws = self._get_or_create_sheet(nome_aba)
             valor_pessoa = valor / divisao
-            ws.append_row([
+
+            # Lê só A:J para não confundir com notas nas colunas L+
+            # Insere na primeira linha vazia dentro da região de dados (A2:J50)
+            data_range = ws.get('A1:J50') or []
+            next_row = 2  # começa após o cabeçalho
+            for i, row in enumerate(data_range[1:], start=2):
+                # Considera ocupada se coluna A (data) ou B (pagador) tiver conteúdo
+                cell_a = row[0].strip() if len(row) > 0 else ''
+                cell_b = row[1].strip() if len(row) > 1 else ''
+                if cell_a or cell_b:
+                    next_row = i + 1
+
+            if next_row > 50:
+                logger.warning("⚠️ Região de dados cheia (A2:J50). Usando linha seguinte.")
+
+            ws.update(f'A{next_row}:J{next_row}', [[
                 data_gasto.strftime('%d/%m/%Y'), quem_pagou, descricao, categoria,
                 f'R$ {valor:.2f}'.replace('.', ','), divisao, quem_repassa,
                 f'R$ {valor_pessoa:.2f}'.replace('.', ','), 'Não Quitado', ''
-            ])
+            ]], value_input_option='USER_ENTERED')
             logger.info(f"✅ Registrado: {quem_pagou} - {descricao} - R${valor:.2f}")
             self.invalidar_cache(nome_aba)   # força releitura na próxima consulta
             return True, valor_pessoa
@@ -542,7 +557,7 @@ class SheetsManager:
                 self._connect()
             nome_aba = self.resolver_nome_aba(nome_aba) or nome_aba
             ws = self.spreadsheet.worksheet(nome_aba)
-            rows = ws.get_all_values()
+            rows = ws.get('A1:J200') or []  # Lê só colunas A:J, ignora notas
             if len(rows) <= 1:
                 return 0, 0
 
@@ -925,7 +940,7 @@ def chamar_groq_perguntar(pergunta: str, dados: dict) -> str:
                 "messages": [
                     {"role": "system", "content": (
                         "Assistente financeiro de 'Finanças Casa MG'. "
-                        "Moradores: Mateus, Cristhian, Marcelo, Eli (Eli só divide água/luz). "
+                        "Moradores: Mateus, Cristhian, Marcelo. "
                         "Responda em português, direto, valores em R$ X,XX."
                     )},
                     {"role": "user", "content": f"{contexto}\nPergunta: {pergunta}"}
@@ -1045,7 +1060,7 @@ async def ajuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "⚡ <b>REGRAS DE DIVISÃO:</b>\n"
         "🏠 Gastos gerais → ÷3 (Mateus, Cristhian, Marcelo)\n"
-        "💧 Água e Luz → ÷4 (todos, inclui Eli)\n"
+        "💧 Água e Luz → ÷3 (Mateus, Cristhian, Marcelo)\n"
         "🐱 Gastos Gata → ÷2 (Mateus, Cristhian)\n"
         "━━━━━━━━━━━━━━━━━━━━━━━"
     )
