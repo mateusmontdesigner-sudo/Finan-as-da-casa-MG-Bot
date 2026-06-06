@@ -227,7 +227,8 @@ def resolver_mes(args: list):
 
 # ─── SHEETS MANAGER ──────────────────────────────────────────
 
-_CACHE_TTL = 60  # segundos — tempo máximo de cache por aba
+_CACHE_TTL = 300  # segundos — 5 minutos de cache por aba
+_CACHE_REFRESH = 240  # refresca em background a cada 4 minutos (antes de expirar)
 
 class SheetsManager:
     def __init__(self):
@@ -319,7 +320,7 @@ class SheetsManager:
         # Força atualização do cache de abas na próxima chamada
         self._abas_cache_ts = 0
 
-    def get_rows(self, nome_aba: str):
+    def get_rows(self, nome_aba: str, forcar_refresh: bool = False):
         try:
             if not self.spreadsheet:
                 self._connect()
@@ -329,9 +330,9 @@ class SheetsManager:
             self._atualizar_cache_abas()
             nome_real = self._abas_cache.get(nome_norm) or nome_aba
 
-            # Retorna do cache se ainda válido
+            # Retorna do cache se ainda válido (stale-while-revalidate: entrega imediato)
             entrada = self._cache.get(nome_real)
-            if entrada:
+            if entrada and not forcar_refresh:
                 ts, rows = entrada
                 if time.time() - ts < _CACHE_TTL:
                     return rows
@@ -541,6 +542,46 @@ sheets = SheetsManager()
 
 # Executor dedicado para chamadas bloqueantes (Sheets, Groq)
 _executor = ThreadPoolExecutor(max_workers=4)
+
+
+# ─── CACHE WARM-UP E REFRESH EM BACKGROUND ───────────────────
+
+def _aquecer_cache():
+    """
+    Carrega no cache as abas do mês atual e anterior.
+    Chamado no startup e periodicamente em background.
+    Nunca bloqueia o usuário — roda em thread separada.
+    """
+    try:
+        sheets._atualizar_cache_abas()
+        mes_atual = MESES_PT[datetime.now().month]
+        mes_anterior_num = datetime.now().month - 1 or 12
+        mes_anterior = MESES_PT[mes_anterior_num]
+        for mes in [mes_atual, mes_anterior]:
+            try:
+                rows = sheets.get_rows(mes, forcar_refresh=True)
+                if rows is not None:
+                    logger.info(f"🔥 Cache aquecido: {mes} ({len(rows)} registros)")
+                else:
+                    logger.info(f"ℹ️ Aba '{mes}' não existe na planilha (normal)")
+            except Exception as e:
+                logger.warning(f"⚠️ Falha ao aquecer cache de {mes}: {e}")
+    except Exception as e:
+        logger.error(f"❌ Erro no warm-up do cache: {e}")
+
+
+async def _loop_refresh_cache(app):
+    """Tarefa asyncio que refresca o cache em background a cada _CACHE_REFRESH segundos."""
+    # Aguarda bot estar pronto antes de iniciar
+    await asyncio.sleep(5)
+    while True:
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(_executor, _aquecer_cache)
+            logger.info(f"🔄 Cache atualizado em background (próximo em {_CACHE_REFRESH}s)")
+        except Exception as e:
+            logger.error(f"❌ Erro no loop de refresh: {e}")
+        await asyncio.sleep(_CACHE_REFRESH)
 
 async def _run(func, *args, **kwargs):
     """Executa função bloqueante em thread sem travar o event loop.
@@ -1367,6 +1408,14 @@ def main():
 
     _diagnostico_startup()
 
+    # Aquece o cache ANTES de aceitar mensagens (roda em thread, não bloqueia o startup)
+    _executor.submit(_aquecer_cache)
+
+    async def post_init(application):
+        """Inicia o loop de refresh em background assim que o bot estiver pronto."""
+        asyncio.create_task(_loop_refresh_cache(application))
+        logger.info("✅ Loop de refresh de cache iniciado")
+
     app = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -1374,6 +1423,7 @@ def main():
         .write_timeout(30)
         .connect_timeout(30)
         .pool_timeout(30)
+        .post_init(post_init)
         .build()
     )
     app.add_handler(CommandHandler("start",     start))
