@@ -634,6 +634,11 @@ async def _run(func, *args, **kwargs):
 
 # ─── DETECÇÃO LOCAL (sem Groq) ────────────────────────────────
 
+# Índices dos padrões de variação com ordem (desc, valor) em vez de (valor, desc)
+_REGEX_GASTOS_LEN = len(_REGEX_GASTOS)
+# _REGEX_VARIACAO_GASTO índices: 0=coloca, 1=reais, 2=custou(desc,val), 3=paguei_o(desc,val),
+#                                4=Nome pagou(val,desc), 5=desc val Nome pagou(desc,val)
+
 def _detectar_gasto_regex(text: str, user_name: str) -> dict | None:
     """Tenta detectar gasto via regex puro. Retorna dict ou None."""
     tl = text.lower().strip()
@@ -645,25 +650,33 @@ def _detectar_gasto_regex(text: str, user_name: str) -> dict | None:
         if not m:
             continue
 
-        # Padrões com ordem (desc, valor)
-        if i == 2 or i >= len(_REGEX_GASTOS):          # "comprei X por Y" e variações novas
-            g1, g2 = m.group(1).strip().title(), m.group(2)
-            # alguns novos regex também têm (desc, valor)
-            if i in (2,) or i >= len(_REGEX_GASTOS):
-                try:
-                    valor = parse_valor(g2)
-                    descricao_raw = g1
-                    if valor <= 0:                      # tenta inverter
-                        valor = parse_valor(g1)
-                        descricao_raw = g2.strip().title()
-                except Exception:
-                    continue
-        elif i == 5:        # "categoria valor"
-            descricao_raw = m.group(1).strip().title()
-            valor = parse_valor(m.group(2))
-        else:
-            valor = parse_valor(m.group(1))
-            descricao_raw = m.group(2).strip().title()
+        n_variacao = i - _REGEX_GASTOS_LEN  # índice dentro de _REGEX_VARIACAO_GASTO (-1 se for _REGEX_GASTOS)
+
+        try:
+            if i < _REGEX_GASTOS_LEN:
+                # _REGEX_GASTOS
+                if i == 2:      # "comprei DESC por VALOR"  → (desc, valor)
+                    descricao_raw = m.group(1).strip().title()
+                    valor = parse_valor(m.group(2))
+                elif i == 5:    # "categoria valor"          → (desc, valor)
+                    descricao_raw = m.group(1).strip().title()
+                    valor = parse_valor(m.group(2))
+                else:           # demais: (valor, desc)
+                    valor = parse_valor(m.group(1))
+                    descricao_raw = m.group(2).strip().title()
+            else:
+                # _REGEX_VARIACAO_GASTO
+                if n_variacao in (2, 3, 5):   # (desc, valor): custou / paguei_o / "desc val Nome pagou"
+                    descricao_raw = m.group(1).strip().title()
+                    valor = parse_valor(m.group(2))
+                elif n_variacao == 4:          # "Nome pagou VALOR de DESC" → (valor, desc)
+                    valor = parse_valor(m.group(1))
+                    descricao_raw = m.group(2).strip().title()
+                else:                          # 0=coloca, 1=reais → (valor, desc)
+                    valor = parse_valor(m.group(1))
+                    descricao_raw = m.group(2).strip().title()
+        except Exception:
+            continue
 
         if valor <= 0:
             continue
