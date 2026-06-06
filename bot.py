@@ -252,14 +252,6 @@ class SheetsManager:
             ]
             creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
             self.client = gspread.authorize(creds)
-
-            # Força timeout de 15s em TODAS as chamadas HTTP do gspread
-            original_request = self.client.http_client.request
-            def request_com_timeout(*args, **kwargs):
-                kwargs.setdefault('timeout', 15)
-                return original_request(*args, **kwargs)
-            self.client.http_client.request = request_com_timeout
-
             self.spreadsheet = self.client.open_by_key(SPREADSHEET_ID)
             logger.info("✅ Conectado ao Google Sheets")
         except Exception as e:
@@ -1337,10 +1329,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── MAIN ─────────────────────────────────────────────────────
 
+def _diagnostico_startup():
+    """Roda no startup e loga o estado da conexão com o Sheets."""
+    logger.info("🔍 [DIAGNÓSTICO] Iniciando verificação...")
+
+    creds_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+    if not creds_json:
+        logger.error("🔍 [DIAGNÓSTICO] GOOGLE_CREDENTIALS_JSON: NÃO CONFIGURADO")
+    else:
+        logger.info(f"🔍 [DIAGNÓSTICO] GOOGLE_CREDENTIALS_JSON: {len(creds_json)} chars")
+        try:
+            d = json.loads(creds_json)
+            logger.info(f"🔍 [DIAGNÓSTICO] JSON válido. type={d.get('type')} email={d.get('client_email')}")
+        except Exception as e:
+            logger.error(f"🔍 [DIAGNÓSTICO] JSON INVÁLIDO: {e}")
+
+    if not sheets.spreadsheet:
+        logger.error("🔍 [DIAGNÓSTICO] sheets.spreadsheet: NÃO CONECTADO — verifique credenciais e ID da planilha")
+    else:
+        try:
+            abas = sheets.spreadsheet.worksheets()
+            nomes = [ws.title for ws in abas]
+            logger.info(f"🔍 [DIAGNÓSTICO] Planilha OK. Abas: {nomes}")
+        except Exception as e:
+            logger.error(f"🔍 [DIAGNÓSTICO] Erro ao listar abas: {e}")
+
+    if not os.getenv('GROQ_API_KEY'):
+        logger.warning("🔍 [DIAGNÓSTICO] GROQ_API_KEY: NÃO CONFIGURADO")
+    else:
+        logger.info("🔍 [DIAGNÓSTICO] GROQ_API_KEY: configurado")
+
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN não configurado!")
         return
+
+    _diagnostico_startup()
 
     app = (
         Application.builder()
