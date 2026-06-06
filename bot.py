@@ -346,13 +346,18 @@ class SheetsManager:
             for row in raw[1:]:
                 while len(row) < 10:
                     row.append('')
-                # Normaliza nomes do pagador para bater com PESSOAS
+                # Normaliza nomes do pagador para bater com PESSOAS (suporta múltiplos: "Mateus, Cristhian")
                 pagador_raw = row[1].strip()
-                pagador_norm = next(
-                    (p for p in PESSOAS if normalizar(p) in normalizar(pagador_raw)
-                     or normalizar(pagador_raw) in normalizar(p)),
-                    pagador_raw
-                )
+                partes_pagador = [p.strip() for p in pagador_raw.split(',') if p.strip()]
+                pagador_norm_parts = []
+                for parte in partes_pagador:
+                    match = next(
+                        (p for p in PESSOAS if normalizar(p) in normalizar(parte)
+                         or normalizar(parte) in normalizar(p)),
+                        parte
+                    )
+                    pagador_norm_parts.append(match)
+                pagador_norm = ', '.join(pagador_norm_parts)
                 repassa_raw = [p.strip() for p in row[6].split(',') if p.strip()]
                 repassa_norm = []
                 for rp in repassa_raw:
@@ -451,17 +456,25 @@ class SheetsManager:
         detalhes_por_item = []
 
         for r in filtrados:
-            pagador  = r['pagador']
+            pagadores = [p.strip() for p in r['pagador'].split(',') if p.strip()]
             val_parte = r['valor'] / r['divisao'] if r['divisao'] else r['valor']
             devedores = []
             for devedor in r['repassa']:
-                if devedor in PESSOAS and devedor != pagador:
-                    saldo[devedor][pagador] += val_parte
-                    devedores.append((devedor, val_parte))
+                if devedor not in PESSOAS:
+                    continue
+                if devedor in pagadores:
+                    continue
+                # O devedor deve val_parte para CADA pagador individualmente
+                # Ex: Mateus+Cristhian pagaram 140 ÷2 = 70 por pessoa
+                # → Marcelo deve 70 para Mateus E 70 para Cristhian
+                for pagador in pagadores:
+                    if pagador in PESSOAS and pagador != devedor:
+                        saldo[devedor][pagador] += val_parte
+                devedores.append((devedor, val_parte * len(pagadores)))
             if devedores:
                 detalhes_por_item.append({
                     'data':        r['data_str'] or 'sem data',
-                    'pagador':     pagador,
+                    'pagador':     r['pagador'],
                     'descricao':   r['descricao'] or r['categoria'],
                     'valor_total': r['valor'],
                     'valor_parte': val_parte,
