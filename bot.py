@@ -300,6 +300,15 @@ class SheetsManager:
             logger.error(f"❌ Erro ao listar abas: {e}")
             return []
 
+    def listar_todas_abas(self) -> list:
+        """Retorna TODOS os títulos de abas (para diagnóstico de erro)."""
+        try:
+            self._atualizar_cache_abas()
+            return list(self._abas_cache.values())
+        except Exception as e:
+            logger.error(f"❌ Erro ao listar todas abas: {e}")
+            return []
+
     def resolver_nome_aba(self, nome_mes_normalizado: str) -> str | None:
         """Dado 'MAIO', retorna o título real da aba (ex: 'Maio', 'maio', 'MAIO')."""
         self._atualizar_cache_abas()
@@ -922,9 +931,13 @@ async def acerto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data is None:
-        abas = await _run(sheets.listar_abas)
+        todas = await _run(sheets.listar_todas_abas)
+        abas_mes = await _run(sheets.listar_abas)
+        logger.warning(f"⚠️ Aba não encontrada. nome_aba='{nome_aba}'. Todas as abas: {todas}")
+        disponiveis = abas_mes if abas_mes else todas
         await update.message.reply_text(
-            f"❌ Mês não encontrado.\nDisponíveis: <b>{', '.join(abas)}</b>",
+            f"❌ Mês não encontrado: <b>{nome_aba or '(nenhum informado)'}</b>\n"
+            f"Disponíveis: <b>{', '.join(disponiveis) if disponiveis else 'nenhuma aba encontrada'}</b>",
             parse_mode='HTML'
         )
         return
