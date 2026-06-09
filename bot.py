@@ -1672,15 +1672,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = msg.from_user.id if msg.from_user else 0
     user_name = identify_user(update)
 
-    # Em grupos: verifica se deve responder
+    # Em grupos: responde sempre (bot financeiro da república — todos os membros são usuários)
+    # Só ignora se for fora de escopo (saudações etc) — isso é tratado depois pelo Groq
     if msg.chat.type != 'private':
-        # Há um gasto pendente aguardando resposta? Sempre processa o reply.
         pendente_ativo = _get_pending(chat_id, user_id)
-        # Parece um registro de gasto? Processa sem precisar de @mencao.
-        eh_gasto = _parece_gasto(text) if text else False
-        # Não é gasto e não foi chamado → ignora
-        if not pendente_ativo and not eh_gasto and not _deve_responder_no_grupo(update):
-            return
+        # Se há pendente, sempre processa
+        if pendente_ativo:
+            pass  # continua normalmente
+        # Se é reply ao bot, sempre processa
+        elif msg.reply_to_message and msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot:
+            pass  # continua normalmente
+        # Caso contrário, processa tudo — o Groq vai classificar fora_escopo se necessário
+        else:
+            pass  # sempre processa no grupo
 
     if not text:
         mention = f"@{BOT_USERNAME}" if BOT_USERNAME else "o bot"
@@ -1705,6 +1709,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         campo_faltante = pendente.get('aguardando')
+
+        # ── Aguardando DESCRIÇÃO ──
+        if campo_faltante == 'descricao':
+            if len(text.strip()) < 2:
+                await msg.reply_text("⚠️ Descrição muito curta. Ex: <b>Açougue, Mercado, Gás</b>", parse_mode='HTML')
+                return
+            pendente['descricao'] = text.strip().title()
+            pendente['categoria'] = detectar_categoria(pendente['descricao'])
+            del pendente['aguardando']
+            _clear_pending(chat_id, user_id)
+            await _registrar_gasto_confirmado(
+                msg,
+                pendente['pagador'], pendente['descricao'],
+                pendente['categoria'], pendente['valor'], pendente.get('data_gasto')
+            )
+            return
 
         # ── Aguardando VALOR ──
         if campo_faltante == 'valor':
@@ -1967,6 +1987,65 @@ def _diagnostico_startup():
         logger.info("🔍 [DIAGNÓSTICO] GROQ_API_KEY: configurado")
 
 
+
+async def registrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/registrar [texto] - registra gasto direto ou guiado"""
+    msg = update.message
+    user_name = identify_user(update)
+    chat_id = msg.chat_id
+    user_id = msg.from_user.id if msg.from_user else 0
+    texto = " ".join(context.args).strip() if context.args else ""
+    opcoes_str = "\n".join(f"{i+1}. {p}" for i, p in enumerate(PESSOAS))
+
+    if not texto:
+        _set_pending(chat_id, user_id, {"aguardando": "pagador", "opcoes_pagador": PESSOAS, "via_registrar": True})
+        await msg.reply_text(
+            "📝 <b>Novo registro de gasto</b>\n\n"
+            "Quem pagou? Digite o número ou nome:\n"
+            f"{opcoes_str}\n\n"
+            "<i>(ou 'cancelar' para desistir)</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    await msg.reply_text("⏳ Processando...")
+    resultado = await _run(_chamar_groq_unificado, texto, user_name)
+    tipo = resultado.get("tipo", "intencao")
+
+    if tipo == "gasto":
+        pagador   = resultado.get("pagador") or user_name
+        descricao = resultado.get("descricao", "")
+        categoria = resultado.get("categoria", "Outros")
+        valor     = float(resultado.get("valor", 0))
+        data_gasto = _extrair_data_mensagem(texto)
+
+        if valor <= 0:
+            _set_pending(chat_id, user_id, {"pagador": pagador, "descricao": descricao,
+                "categoria": categoria, "valor": 0, "data_gasto": data_gasto,
+                "aguardando": "valor", "via_registrar": True})
+            await msg.reply_text(
+                f"❓ Qual foi o valor de <b>{descricao or 'esse gasto'}</b>?\n"
+                "<i>(ex: 87,50 ou 'cancelar')</i>", parse_mode="HTML")
+            return
+
+        if not descricao:
+            _set_pending(chat_id, user_id, {"pagador": pagador, "descricao": "",
+                "categoria": categoria, "valor": valor, "data_gasto": data_gasto,
+                "aguardando": "descricao", "via_registrar": True})
+            await msg.reply_text(
+                f"❓ Qual a descrição do gasto de <b>R$ {valor:.2f}</b>?\n"
+                "<i>(ex: Açougue, Mercado, Gás...)</i>", parse_mode="HTML")
+            return
+
+        await _registrar_gasto_confirmado(msg, pagador, descricao, categoria, valor, data_gasto)
+    else:
+        _set_pending(chat_id, user_id, {"aguardando": "pagador", "opcoes_pagador": PESSOAS, "via_registrar": True})
+        await msg.reply_text(
+            "⚠️ Não consegui identificar os dados. Vamos preencher passo a passo.\n\n"
+            "Quem pagou? Digite o número ou nome:\n"
+            f"{opcoes_str}\n\n"
+            "<i>(ou 'cancelar' para desistir)</i>", parse_mode="HTML")
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN não configurado!")
@@ -2001,6 +2080,7 @@ def main():
     app.add_handler(CommandHandler("extrato",   extrato))
     app.add_handler(CommandHandler("quitar",    quitar))
     app.add_handler(CommandHandler("perguntar", perguntar))
+    app.add_handler(CommandHandler("registrar", registrar))
     app.add_handler(CommandHandler("debug",     debug_acerto))
     # Texto livre — privado e grupos
     app.add_handler(MessageHandler(
